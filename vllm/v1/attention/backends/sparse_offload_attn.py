@@ -22,6 +22,9 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 class SparseOffloadAttentionBackend(AttentionBackend):
+
+    accept_output_buffer: bool = True 
+    
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
         # TODO: check other sizes
@@ -188,6 +191,8 @@ class SparseOffloadAttentionImpl(AttentionImpl):
             kv_cache = [2, num_blocks, block_size, num_kv_heads, head_size]
             attn_metadata: Metadata for attention.
         """
+        assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0, (
+            "key/v_scale is not supported in SparseOffloadAttention.")
         assert output is not None, "output must be provided"
 
         if attn_metadata is None:
@@ -198,6 +203,6 @@ class SparseOffloadAttentionImpl(AttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(0)
-        
+
         
         raise NotImplementedError("SparseOffloadAttentionImpl.forward is not implemented")
