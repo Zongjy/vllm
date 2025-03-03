@@ -101,6 +101,7 @@ def get_attn_backend(
         is_blocksparse=is_blocksparse,
         use_v1=envs.VLLM_USE_V1,
         use_mla=use_mla,
+        use_sparse_offload=envs.VLLM_USE_SPARSE_OFFLOAD,
     )
 
 
@@ -114,7 +115,15 @@ def _cached_get_attn_backend(
     is_blocksparse: bool = False,
     use_v1: bool = False,
     use_mla: bool = False,
+    use_sparse_offload: bool = False,
 ) -> Type[AttentionBackend]:
+    # TODO: rearrange these codes
+    if use_sparse_offload:
+        logger.info("Using SparseOffloadAttention backend.")
+        from vllm.v1.attention.backends.sparse_offload_attn import (
+            SparseOffloadAttentionBackend)
+        return SparseOffloadAttentionBackend
+
     if is_blocksparse:
         logger.info("Using BlocksparseFlashAttention backend.")
         from vllm.attention.backends.blocksparse_attn import (
