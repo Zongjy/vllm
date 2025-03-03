@@ -24,7 +24,7 @@ logger = init_logger(__name__)
 class SparseOffloadAttentionBackend(AttentionBackend):
 
     accept_output_buffer: bool = True 
-    
+
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
         # TODO: check other sizes
@@ -120,10 +120,6 @@ class SparseOffloadAttentionMetadataBuilder:
             block_table=block_table,
             slot_mapping=slot_mapping,
             # TODO: adopt cascade attention
-            use_cascade=False,
-            cu_prefix_query_lens=None,
-            prefix_kv_lens=None,
-            suffix_kv_lens=None,
         )
         return attn_metadata
     
@@ -201,8 +197,14 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         
         # TODO: support CUDA graph
 
+        # NOTE(yangshen): Here is the tough part - batch & transfer & sparse
+        # 1. Pass the Block Manager to the forward context
+        # 2. Modify the Block Manager to reallocate blocks according to query
+        # 3. Correctly compute the attention scores
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(0)
 
+        # TODO: (step 1, yangshen) yangshen, pass the BlockManager here and aggressively control it
+        
         
         raise NotImplementedError("SparseOffloadAttentionImpl.forward is not implemented")
