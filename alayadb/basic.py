@@ -7,6 +7,7 @@ from rich.table import Table
 from datetime import datetime
 import os
 
+os.environ["VLLM_USE_V1"] = "1"
 # os.environ["VLLM_USE_SPARSE_OFFLOAD"] = 1
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 
@@ -28,9 +29,9 @@ console = Console()
 # Sample prompts.
 prompts = [
     "Hello, my name is",
-    "The president of the United States is",
-    "The capital of France is",
-    "The future of AI is",
+    # "The president of the United States is",
+    # "The capital of France is",
+    # "The future of AI is",
 ]
 # Create a sampling params object.
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
@@ -46,7 +47,7 @@ logger.info("Loading model successful.")
 # that contain the prompt, generated text, and other information.
 outputs = llm.generate(prompts, sampling_params)
 
-table = Table(title="📜 vLLM generated texts", show_lines=True)
+table = Table(title="vLLM generated texts", show_lines=True)
 table.add_column("Prompt", justify="left", style="cyan", no_wrap=False)
 table.add_column("Generated Text", justify="left", style="green")
 
