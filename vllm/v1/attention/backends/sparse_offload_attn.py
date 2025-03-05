@@ -104,7 +104,7 @@ class SparseOffloadAttentionMetadataBuilder:
         block_table = (
             self.runner.input_batch.block_table.get_device_tensor()[:num_reqs])
         slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
-            self.runner.device, non_blocking=True).long()      
+            self.runner.device, non_blocking=True).long()
         
         use_cascade = False
         cu_prefix_query_lens = None
@@ -204,7 +204,87 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(0)
 
-        # TODO: (step 1, yangshen) yangshen, pass the BlockManager here and aggressively control it
-        
+        # NOTE(liyi): Here we may not change the slot_mapping, cause full 
+        # kv_cache is stored as origin. We only select crucial kv blocks 
+        # for each req and rebuild a block_table for varlen_flash_attn.
+        torch.ops._C_cache_ops.reshape_and_cache_flash(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            attn_metadata.slot_mapping,
+            self.kv_cache_dtype,
+            layer._k_scale,
+            layer._v_scale,
+        )
+
+        # (step 1) Select crucial kv blocks for each req **in CPU**
+        # new_block_table = varlen_sparse_kv_selection(**)
+
+        # (step 2) Swap the selected kv blocks to GPU
+
+        # NOTE(liyi): I'm confused about whether following things right:
+        # 1. Initialize_kvcache & bind_kvcache in CPU
+        # 2. In every layer's attn, send qkv to CPU
+        # 3. Select crucial kv blocks in CPU
+        # 4. Swap the selected kv blocks to GPU & perform flash_attn
         
         raise NotImplementedError("SparseOffloadAttentionImpl.forward is not implemented")
+
+def varlen_sparse_kv_selection(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    query_lens: List[int],
+    kv_lens: List[int],
+    block_table: torch.Tensor,
+    moba_topk: int,
+    alibi_slopes: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """
+        (liyi) simply modified from 
+            - vllm.tests.test_flash_attn.ref_paged_attn &
+            - https://github.com/MoonshotAI/MoBA/blob/master/moba/moba_naive.py#L7
+        to select crucial kv blocks for each req by:
+            1. estimate score by matmul(q, mean_pooling(k.T)) [Snapkv, MoBA]
+            2. select top-k scores
+
+        Here, we should calculate the gate in CPU, and then swap the selected kv blocks to GPU.
+    """
+
+    num_seqs = len(query_lens)
+    block_table = block_table.cpu().numpy()
+    new_block_table = np.zeros_like(block_table)
+
+    _, block_size, num_kv_heads, head_size = key_cache.shape
+    start_idx = 0
+
+    for i in range(num_seqs):
+        query_len = query_lens[i]
+        kv_len = kv_lens[i]
+        q = query[start_idx:start_idx + query_len]
+
+        num_kv_blocks = (kv_len + block_size - 1) // block_size
+        block_indices = block_table[i, :num_kv_blocks]
+
+        k = key_cache[block_indices].view(-1, num_kv_heads, head_size)  # [num_kv_blocks * block_size, num_kv_heads, head_size]
+        k = k[:kv_len]
+        # split k into chunks
+        k = k.view(-1, block_size, num_kv_heads, head_size)             # [num_kv_blocks, block_size, num_kv_heads, head_size]
+        # mean pooling
+        k_pooled = k.mean(dim=1)                                        # [num_kv_blocks, num_kv_heads, head_size]
+        # equivalent to torch.matmul(q, k_pooled)
+        # TODO: check if position_embedding is needed
+        gate = torch.einsum("qhd,khd->hqk", q, k_pooled).float()        # [query_len, num_kv_blocks, num_kv_heads]
+
+        # NOTE(liyi): MoBA sets a casual mask for avoids any leakage of 
+        # information from subsequent tokens. I think query_len > 1 only 
+        # occurs in chunked prifills, in which case we don't need to mask.
+
+        _, gate_top_k_idx = torch.topk(gate, k=moba_topk, dim=0, largest=True, sorted=False)
+        gate_idx_mask = torch.zeros(k_pooled.shape, dtype=torch.bool, device=q.device)  # [num_kv_blocks, num_kv_heads, head_size]
+        gate_idx_mask = gate_idx_mask.scatter_(dim=0, index=gate_top_k_idx, value=True)
+
+        new_block_table[i, :num_kv_blocks] = block_indices[gate_idx_mask]
+
+    # TODO: what should this func reture?
+    return new_block_table
