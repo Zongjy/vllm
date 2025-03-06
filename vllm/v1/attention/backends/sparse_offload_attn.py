@@ -297,8 +297,10 @@ class SparseOffloadAttentionImpl(AttentionImpl):
 def varlen_sparse_kv_selection(
     query: torch.Tensor,
     key_cache: torch.Tensor,
-    cu_seqlens_q: torch.Tensor,  # query_start_loc, used to index q, accumulated
-    seqlens_k: torch.Tensor,  # seq_lens, used to index kv cache, listed
+    # query_start_loc, used to index q, accumulated, q means query
+    cu_seqlens_q: torch.Tensor,
+    # seq_lens, used to index kv cache, listed, k means key
+    seqlens_k: torch.Tensor,
     block_table: torch.Tensor,
     topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -310,14 +312,17 @@ def varlen_sparse_kv_selection(
     to select crucial kv blocks for each req by:
         1. estimate score by matmul(q, mean_pooling(k.T)) [Snapkv, MoBA]
         2. select top-k scores
-    Here, we should calculate the gate in CPU, and then swap the selected kv blocks to GPU.
+    Here, we should calculate the gate in CPU, and then
+    swap the selected kv blocks to GPU.
 
     return: block_table, seq_lens_k
     -------------------------------
     NOTE(yangshen)
-    We are implementing a simple mean-pooling based block selection inside GPU now.
+    We are implementing a simple mean-pooling based
+        block selection inside GPU now.
     - It do sparse only for decode.
-    - It specify the blocks by returning a new block_table and cu_seqlens_k to flash_attention.
+    - It specify the blocks by returning a new block_table and
+        cu_seqlens_k to flash_attention.
 
     Then we will move to InfLLM, CPU offloading and chunked prefill.
     """
@@ -336,11 +341,12 @@ def varlen_sparse_kv_selection(
         q_len = q_end - q_start
         k_len = seqlens_k[seq_idx].item()
 
-        # NOTE(yangshen): Since the FlashAttention only supports right align the causal masks.
+        # NOTE(yangshen):
+        # Since the FlashAttention only supports right align the causal masks.
         # We will not drop any blocks with query on it.
         # https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#how-to-use-flashattention
-        # block table:      | --------- num_sparse_blks -- | -- num_full_blks -- |
-        # after selection:            | -- num_sel_blks -- | -- num_full_blks -- |
+        # block table:    | --------- num_sparse_blks -- | -- num_full_blks -- |
+        # after selection:          | -- num_sel_blks -- | -- num_full_blks -- |
         num_seq_blks = math.ceil(k_len / block_size)
         num_full_blks = math.ceil(
             q_len / block_size
@@ -393,38 +399,11 @@ def varlen_sparse_kv_selection(
 
     return new_block_table, new_seq_lens_k
 
-    # for seq_idx in range(num_seqs):
-    #     seq_start = cu_seqlens_q[seq_idx]
-    #     seq_end = cu_seqlens_q[seq_idx + 1]
-    #     seq_len = seq_end - seq_start
-
-    #     # q = query[start_idx:seq_end]  # [query_len, num_heads, head_size]
-
-    #     num_kv_blocks = seq_len // block_size # we do not consider the last incomplete block
-    #     block_indices = block_table[seq_idx, :num_kv_blocks]
-
-    #     k = key_cache[block_indices].view(-1, num_kv_heads, head_size)  # [num_kv_blocks * block_size, num_kv_heads, head_size]
-    #     k = k.view(-1, block_size, num_kv_heads, head_size)             # [num_kv_blocks, block_size, num_kv_heads, head_size]
-    #     # TODO: mean pooling, decouple to support other algorithms
-    #     k_pooled = k.mean(dim=1)                                        # [num_kv_blocks, num_kv_heads, head_size]
-    #     # equivalent to torch.matmul(q, k_pooled)
-    #     gate = torch.einsum("qhd,khd->hqk", q, k_pooled).float()        # [query_len, num_kv_blocks, num_kv_heads]
-
-    #     # NOTE(liyi): MoBA sets a casual mask for avoids any leakage of
-    #     # information from subsequent tokens. I think query_len > 1 only
-    #     # occurs in chunked prifills, in which case we don't need to mask.
-
-    #     _, gate_top_k_idx = torch.topk(gate, k=topk, dim=0, largest=True, sorted=False)
-    #     gate_idx_mask = torch.zeros(k_pooled.shape, dtype=torch.bool, device=q.device)  # [num_kv_blocks, num_kv_heads, head_size]
-    #     gate_idx_mask = gate_idx_mask.scatter_(dim=0, index=gate_top_k_idx, value=True)
-
-    #     new_block_table[seq_idx, :num_kv_blocks] = block_indices[gate_idx_mask]
-
-
 def repeat_kv(kv: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
-    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
-    num_key_value_heads, seqlen, head_dim) to (batch, num_attention_heads, seqlen, head_dim)
+    This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep).
+    The hidden states go from (batch, num_key_value_heads, seqlen, head_dim)
+         to (batch, num_attention_heads, seqlen, head_dim)
     """
     batch, num_key_value_heads, slen, head_dim = kv.shape
     if n_rep == 1:
