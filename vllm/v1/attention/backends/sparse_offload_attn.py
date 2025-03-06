@@ -1,6 +1,6 @@
-
 # SPDX-License-Identifier: Apache-2.0
 """Attention layer with FlashAttention."""
+
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Type
 
@@ -10,8 +10,12 @@ import math
 
 import torch.torch_version
 
-from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
-                                              AttentionMetadata, AttentionType)
+from vllm.attention.backends.abstract import (
+    AttentionBackend,
+    AttentionImpl,
+    AttentionMetadata,
+    AttentionType,
+)
 from vllm.attention.backends.utils import get_flash_attn_version
 from vllm.attention.ops.triton_merge_attn_states import merge_attn_states
 from vllm.logger import init_logger
@@ -29,44 +33,41 @@ if current_platform.is_cuda():
 
 logger = init_logger(__name__)
 
-class SparseOffloadAttentionBackend(AttentionBackend):
 
-    accept_output_buffer: bool = True 
+class SparseOffloadAttentionBackend(AttentionBackend):
+    accept_output_buffer: bool = True
 
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
         # TODO: check other sizes
         return [128]
-    
+
     @staticmethod
     def get_name() -> str:
         return "SPARSE_OFFLOAD_ATTN_VLLM_V1"
-    
+
     @staticmethod
     def get_impl_cls() -> Type["SparseOffloadAttentionImpl"]:
         return SparseOffloadAttentionImpl
-    
+
     @staticmethod
     def get_metadata_cls() -> Type["AttentionMetadata"]:
         return SparseOffloadAttentionMetadata
-    
+
     @staticmethod
     def get_builder_cls() -> Type["SparseOffloadAttentionMetadataBuilder"]:
         return SparseOffloadAttentionMetadataBuilder
-    
+
     @staticmethod
-    def get_kv_cache_shape(
-        num_blocks, 
-        block_size, 
-        num_kv_heads, 
-        head_size):
+    def get_kv_cache_shape(num_blocks, block_size, num_kv_heads, head_size):
         if block_size % 16 != 0:
             raise ValueError("block_size must be a multiple of 16")
         return (2, num_blocks, block_size, num_kv_heads, head_size)
-    
+
     @staticmethod
     def use_cascade_attention(*args, **kwargs) -> bool:
         return False
+
 
 @dataclass
 class SparseOffloadAttentionMetadata:
@@ -76,48 +77,61 @@ class SparseOffloadAttentionMetadata:
     # |- tokenA -|......................|-- newTokens ---|
     # |---------- context_len ----------|
     # |-------------------- seq_len ---------------------|
-    #                                   |-- query_len ---|  
+    #                                   |-- query_len ---|
 
     num_actual_tokens: int
     max_query_len: int
     query_start_loc: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
-    block_table: torch.Tensor # TODO: logical to physical
-    slot_mapping: torch.Tensor # TODO: logical to physical
-    
+    block_table: torch.Tensor  # TODO: logical to physical
+    slot_mapping: torch.Tensor  # TODO: logical to physical
+
     # TODO: for cascade attention
 
     # For logging
-    num_input_tokens: int = 0 # Number of tokens including padding
+    num_input_tokens: int = 0  # Number of tokens including padding
+
 
 class SparseOffloadAttentionMetadataBuilder:
-    
     def __init__(self, runner: "GPUModelRunner"):
         # TODO: co processing model runner
         self.runner = runner
-    
-    def reorder_batch(self, input_batch: "InputBatch",
-                      scheduler_output: "SchedulerOutput"):
+
+    def reorder_batch(
+        self, input_batch: "InputBatch", scheduler_output: "SchedulerOutput"
+    ):
         pass
 
-    def build(self, num_reqs: int, num_actual_tokens: int, max_query_len: int,
-              common_prefix_len: int):
+    def build(
+        self,
+        num_reqs: int,
+        num_actual_tokens: int,
+        max_query_len: int,
+        common_prefix_len: int,
+    ):
         max_seq_len = self.runner.seq_lens_np[:num_reqs].max()
-        query_start_loc = self.runner.query_start_loc_cpu[:num_reqs + 1].to(
-            self.runner.device, non_blocking=True)
-        seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(self.runner.device,
-                                                          non_blocking=True)
+        query_start_loc = self.runner.query_start_loc_cpu[: num_reqs + 1].to(
+            self.runner.device, non_blocking=True
+        )
+        seq_lens = self.runner.seq_lens_cpu[:num_reqs].to(
+            self.runner.device, non_blocking=True
+        )
         # TODO: two things
-        block_table = (
-            self.runner.input_batch.block_table.get_device_tensor()[:num_reqs])
-        slot_mapping = self.runner.slot_mapping_cpu[:num_actual_tokens].to(
-            self.runner.device, non_blocking=True).long()
-        
-        use_cascade = False
-        cu_prefix_query_lens = None
-        prefix_kv_lens = None
-        suffix_kv_lens = None
+        block_table = self.runner.input_batch.block_table.get_device_tensor()[
+            :num_reqs
+        ]
+        slot_mapping = (
+            self.runner.slot_mapping_cpu[:num_actual_tokens]
+            .to(self.runner.device, non_blocking=True)
+            .long()
+        )
+
+        # we do not support the cascade attention ye
+        # use_cascade = False
+        # cu_prefix_query_lens = None
+        # prefix_kv_lens = None
+        # suffix_kv_lens = None
 
         attn_metadata = SparseOffloadAttentionMetadata(
             num_actual_tokens=num_actual_tokens,
@@ -130,7 +144,8 @@ class SparseOffloadAttentionMetadataBuilder:
             # TODO: adopt cascade attention
         )
         return attn_metadata
-    
+
+
 class SparseOffloadAttentionImpl(AttentionImpl):
     def __init__(
         self,
@@ -149,13 +164,13 @@ class SparseOffloadAttentionImpl(AttentionImpl):
             raise ValueError("blocksparse_params is not supported")
         self.num_heads = num_heads
         self.head_size = head_size
-        self.scale = float(scale) 
-        self.num_kv_heads = num_kv_heads # TODO: check
+        self.scale = float(scale)
+        self.num_kv_heads = num_kv_heads  # TODO: check
         if alibi_slopes is not None:
             raise ValueError("alibi_slopes is not supported")
         if sliding_window is not None:
             raise ValueError("sliding_window is not supported")
-        self.sliding_window = (-1, -1) # TODO: check
+        self.sliding_window = (-1, -1)  # TODO: check
         self.kv_cache_dtype = kv_cache_dtype
         if logits_soft_cap is not None:
             raise ValueError("logits_soft_cap is not supported")
@@ -164,16 +179,22 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         assert self.num_heads % self.num_kv_heads == 0
         self.num_queries_per_kv = self.num_heads // self.num_kv_heads
 
-        support_head_sizes = SparseOffloadAttentionBackend.get_supported_head_sizes()
+        support_head_sizes = (
+            SparseOffloadAttentionBackend.get_supported_head_sizes()
+        )
         if self.head_size not in support_head_sizes:
-            raise ValueError(f"head_size {self.head_size} is not supported by SparseOffloadAttnBackend"
-                             f"supported head sizes are: {support_head_sizes}")
+            raise ValueError(
+                f"head_size {self.head_size} is not supported by SparseOffloadAttnBackend"
+                f"supported head sizes are: {support_head_sizes}"
+            )
 
         if attn_type != AttentionType.DECODER:
-            raise NotImplementedError("Encoder self-attention and "
-                                      "encoder/decoder cross-attention "
-                                      "are not implemented for "
-                                      "SparseOffloadAttentonImpl")
+            raise NotImplementedError(
+                "Encoder self-attention and "
+                "encoder/decoder cross-attention "
+                "are not implemented for "
+                "SparseOffloadAttentonImpl"
+            )
 
         self.vllm_flash_attn_version = get_flash_attn_version()
 
@@ -200,13 +221,14 @@ class SparseOffloadAttentionImpl(AttentionImpl):
             attn_metadata: Metadata for attention.
         """
         assert layer._k_scale_float == 1.0 and layer._v_scale_float == 1.0, (
-            "key/v_scale is not supported in SparseOffloadAttention.")
+            "key/v_scale is not supported in SparseOffloadAttention."
+        )
         assert output is not None, "output must be provided"
 
         if attn_metadata is None:
             # Profiling run
             return output
-        
+
         # TODO: support CUDA graph
 
         # NOTE(yangshen): Here is the tough part - batch & transfer & sparse
@@ -216,8 +238,8 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         num_actual_tokens = attn_metadata.num_actual_tokens
         key_cache, value_cache = kv_cache.unbind(0)
 
-        # NOTE(liyi): Here we may not change the slot_mapping, cause full 
-        # kv_cache is stored as origin. We only select crucial kv blocks 
+        # NOTE(liyi): Here we may not change the slot_mapping, cause full
+        # kv_cache is stored as origin. We only select crucial kv blocks
         # for each req and rebuild a block_table for varlen_flash_attn.
         torch.ops._C_cache_ops.reshape_and_cache_flash(
             key,
@@ -226,7 +248,7 @@ class SparseOffloadAttentionImpl(AttentionImpl):
             value_cache,
             attn_metadata.slot_mapping,
             self.kv_cache_dtype,
-            layer._k_scale, 
+            layer._k_scale,
             layer._v_scale,
         )
 
@@ -234,9 +256,9 @@ class SparseOffloadAttentionImpl(AttentionImpl):
             query,
             key_cache,
             cu_seqlens_q=attn_metadata.query_start_loc,
-            seqlens_k=attn_metadata.seq_lens, # seqused_k
+            seqlens_k=attn_metadata.seq_lens,  # seqused_k
             block_table=attn_metadata.block_table,
-            topk=self.topk
+            topk=self.topk,
         )
 
         flash_attn_varlen_func(
@@ -246,18 +268,16 @@ class SparseOffloadAttentionImpl(AttentionImpl):
             out=output[:num_actual_tokens],
             cu_seqlens_q=attn_metadata.query_start_loc,
             max_seqlen_q=attn_metadata.max_query_len,
-            seqused_k=sparse_seqlens_k, # sparse
-            max_seqlen_k=attn_metadata.max_seq_len, # TODO: update
+            seqused_k=sparse_seqlens_k,  # sparse
+            max_seqlen_k=attn_metadata.max_seq_len,  # TODO: update
             softmax_scale=self.scale,
             causal=True,
-            block_table=sparse_block_table, # sparse
-            softcap=self.logits_soft_cap, # TODO check
+            block_table=sparse_block_table,  # sparse
+            softcap=self.logits_soft_cap,  # TODO check
             fa_version=self.vllm_flash_attn_version,
         )
 
         return output
-    
-    
 
         # (step 1) Select crucial kv blocks for each req **in CPU**
 
@@ -268,20 +288,23 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         # 2. In every layer's attn, send qkv to CPU
         # 3. Select crucial kv blocks in CPU
         # 4. Swap the selected kv blocks to GPU & perform flash_attn
-        
-        raise NotImplementedError("SparseOffloadAttentionImpl.forward is not implemented")
+
+        raise NotImplementedError(
+            "SparseOffloadAttentionImpl.forward is not implemented"
+        )
+
 
 def varlen_sparse_kv_selection(
     query: torch.Tensor,
     key_cache: torch.Tensor,
-    cu_seqlens_q: torch.Tensor, # query_start_loc, used to index q, accumulated
-    seqlens_k: torch.Tensor, # seq_lens, used to index kv cache, listed
+    cu_seqlens_q: torch.Tensor,  # query_start_loc, used to index q, accumulated
+    seqlens_k: torch.Tensor,  # seq_lens, used to index kv cache, listed
     block_table: torch.Tensor,
     topk: int,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
 
-    NOTE(liyi) simply modified from 
+    NOTE(liyi) simply modified from
         - vllm.tests.test_flash_attn.ref_paged_attn &
         - https://github.com/MoonshotAI/MoBA/blob/master/moba/moba_naive.py#L7
     to select crucial kv blocks for each req by:
@@ -293,7 +316,7 @@ def varlen_sparse_kv_selection(
     -------------------------------
     NOTE(yangshen)
     We are implementing a simple mean-pooling based block selection inside GPU now.
-    - It do sparse only for decode. 
+    - It do sparse only for decode.
     - It specify the blocks by returning a new block_table and cu_seqlens_k to flash_attention.
 
     Then we will move to InfLLM, CPU offloading and chunked prefill.
@@ -313,39 +336,60 @@ def varlen_sparse_kv_selection(
         q_len = q_end - q_start
         k_len = seqlens_k[seq_idx].item()
 
-        # NOTE(yangshen): Since the FlashAttention only supports right align the causal masks. 
+        # NOTE(yangshen): Since the FlashAttention only supports right align the causal masks.
         # We will not drop any blocks with query on it.
         # https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#how-to-use-flashattention
         # block table:      | --------- num_sparse_blks -- | -- num_full_blks -- |
         # after selection:            | -- num_sel_blks -- | -- num_full_blks -- |
         num_seq_blks = math.ceil(k_len / block_size)
-        num_full_blks = math.ceil(q_len / block_size) # blocks for full attention
-        num_sparse_blks = num_seq_blks - num_full_blks # blocks for sparse attention
+        num_full_blks = math.ceil(
+            q_len / block_size
+        )  # blocks for full attention
+        num_sparse_blks = (
+            num_seq_blks - num_full_blks
+        )  # blocks for sparse attention
         if num_sparse_blks == 0 or num_sparse_blks <= topk:
             continue
 
         # select the blocks
         k_blks_idx = block_table[seq_idx, :num_sparse_blks]
-        k_blks = key_cache[k_blks_idx] # [num_sparse_blocks, block_size, num_kv_heads, head_size]
-        
+        k_blks = key_cache[
+            k_blks_idx
+        ]  # [num_sparse_blocks, block_size, num_kv_heads, head_size]
+
         # pooling with mean
-        k_blks_pooled = k_blks.mean(dim=1)  # [num_sparse_blocks, num_kv_heads, head_size]
+        k_blks_pooled = k_blks.mean(
+            dim=1
+        )  # [num_sparse_blocks, num_kv_heads, head_size]
         q = query[q_start:q_end]  # [q_len, num_heads, head_size]
 
         # repeat for GQA
         num_kv_groups = num_heads // num_kv_heads
-        k_blks_pooled = torch.repeat_interleave(k_blks_pooled, num_kv_groups, dim=1) # [num_sparse_blocks, num_heads, head_size]
-        gate = torch.einsum("qhd,khd->qhk", q, k_blks_pooled).float()  # [q_len, num_heads, num_sparse_blocks]
+        k_blks_pooled = torch.repeat_interleave(
+            k_blks_pooled, num_kv_groups, dim=1
+        )  # [num_sparse_blocks, num_heads, head_size]
+        gate = torch.einsum(
+            "qhd,khd->qhk", q, k_blks_pooled
+        ).float()  # [q_len, num_heads, num_sparse_blocks]
         gate_pooled = gate.mean(dim=0).mean(dim=0)  # [num_sparse_blocks]
 
-        _, sel_blks_idx = torch.topk(gate_pooled, k=topk, largest=True, sorted=False) # idx in block_table
+        _, sel_blks_idx = torch.topk(
+            gate_pooled, k=topk, largest=True, sorted=False
+        )  # idx in block_table
 
         num_sel_blks = sel_blks_idx.numel()
-        new_block_table[seq_idx, :num_sel_blks] = block_table[seq_idx, sel_blks_idx]
-        new_block_table[seq_idx, num_sel_blks:num_sel_blks + num_full_blks] = \
-            block_table[seq_idx, num_sparse_blks:num_sparse_blks + num_full_blks]
-        
-        new_seq_lens_k[seq_idx] = k_len - (num_sparse_blks - num_sel_blks) * block_size
+        new_block_table[seq_idx, :num_sel_blks] = block_table[
+            seq_idx, sel_blks_idx
+        ]
+        new_block_table[
+            seq_idx, num_sel_blks : num_sel_blks + num_full_blks
+        ] = block_table[
+            seq_idx, num_sparse_blks : num_sparse_blks + num_full_blks
+        ]
+
+        new_seq_lens_k[seq_idx] = (
+            k_len - (num_sparse_blks - num_sel_blks) * block_size
+        )
 
     return new_block_table, new_seq_lens_k
 
@@ -366,8 +410,8 @@ def varlen_sparse_kv_selection(
     #     # equivalent to torch.matmul(q, k_pooled)
     #     gate = torch.einsum("qhd,khd->hqk", q, k_pooled).float()        # [query_len, num_kv_blocks, num_kv_heads]
 
-    #     # NOTE(liyi): MoBA sets a casual mask for avoids any leakage of 
-    #     # information from subsequent tokens. I think query_len > 1 only 
+    #     # NOTE(liyi): MoBA sets a casual mask for avoids any leakage of
+    #     # information from subsequent tokens. I think query_len > 1 only
     #     # occurs in chunked prifills, in which case we don't need to mask.
 
     #     _, gate_top_k_idx = torch.topk(gate, k=topk, dim=0, largest=True, sorted=False)
@@ -385,5 +429,7 @@ def repeat_kv(kv: torch.Tensor, n_rep: int) -> torch.Tensor:
     batch, num_key_value_heads, slen, head_dim = kv.shape
     if n_rep == 1:
         return kv
-    kv = kv[:, :, None, :, :].expand(batch, num_key_value_heads, n_rep, slen, head_dim)
+    kv = kv[:, :, None, :, :].expand(
+        batch, num_key_value_heads, n_rep, slen, head_dim
+    )
     return kv.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
