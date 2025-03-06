@@ -13,8 +13,9 @@ logger = vllm.logger.logger
 
 # Sample prompts.
 prompts = [
-    "Hello, my name is",
-    # "The president of the United States is",
+    "Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is Hello, my name is ",
+    
+    "The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is The president of the United States is ",
     # "The capital of France is",
     # "The future of AI is",
 ]
@@ -22,7 +23,7 @@ prompts = [
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Create an LLM.
-model = "meta-llama/Llama-3.2-1B-Instruct"
+model = "meta-llama/Meta-Llama-3-8B-Instruct"
 llm = LLM(model=model, enforce_eager=True, gpu_memory_utilization=0.7)
 
 # Generate texts from the prompts. The output is a list of RequestOutput objects
