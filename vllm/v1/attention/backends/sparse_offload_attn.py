@@ -178,7 +178,7 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         self.vllm_flash_attn_version = get_flash_attn_version()
 
         # TODO: the underlying are sparse attention parameters, we fix it now
-        self.topk = 16
+        self.topk = 4
 
     def forward(
         self,
