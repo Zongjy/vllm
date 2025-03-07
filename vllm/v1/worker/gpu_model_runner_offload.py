@@ -34,10 +34,9 @@ from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.rejection_sampler import INVALID_TOKEN_ID, RejectionSampler
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
-from vllm.v1.utils import bind_kv_cache
 from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
-from vllm.v1.core.context_manager import KVCacheContextManager
+from vllm.v1.core.kv_cache_context_manager import KVCacheContextManager
 
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler_output import SchedulerOutput
@@ -134,9 +133,6 @@ class GPUModelRunnerOffload(LoRAModelRunnerMixin):
         self.max_num_encoder_input_tokens = encoder_compute_budget
         self.encoder_cache_size = encoder_cache_size
 
-        # Lazy initialization
-        # self.model: nn.Module  # Set after load_model
-        # self.kv_caches: List[torch.Tensor] = []
         # req_id -> (input_id -> encoder_output)
         self.encoder_cache: Dict[str, Dict[int, torch.Tensor]] = {}
 
@@ -253,7 +249,7 @@ class GPUModelRunnerOffload(LoRAModelRunnerMixin):
                                         dtype=torch.int32,
                                         device="cpu",
                                         pin_memory=self.pin_memory)
-        self.seq_lens_np = self.seq_lens_cpu.numpy()
+        self.seq_lens_np = self.seq_lens_cpu.numpy()    
         self.kvcache_context_manager = KVCacheContextManager(vllm_config, device)
 
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
@@ -1179,6 +1175,7 @@ class GPUModelRunnerOffload(LoRAModelRunnerMixin):
         return hidden_states
 
     def profile_run(self) -> None:
+        # TODO(liyi): Profiling needs to run with non-sparse mode.
         # Profile with multimodal encoder & encoder cache.
         # TODO: handle encoder-decoder models once we support them.
         if (self.is_multimodal_model and self.max_num_encoder_input_tokens > 0

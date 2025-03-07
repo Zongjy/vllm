@@ -555,7 +555,8 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
 
 def get_kv_cache_configs(vllm_config: VllmConfig,
                          kv_cache_specs: List[KVCacheSpec],
-                         available_memory: int) -> List[KVCacheConfig]:
+                         available_gpu_memory: int,
+                         available_cpu_memory) -> List[KVCacheConfig]:
     """
     Generates the KV cache configuration for a model
     TODO: support hybrid models with more than one type of KV cache.

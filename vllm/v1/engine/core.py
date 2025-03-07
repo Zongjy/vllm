@@ -96,11 +96,12 @@ class EngineCore:
 
         # Profiles the peak memory usage of the model to determine how much
         # memory can be allocated for kv cache.
-        available_gpu_memory = self.model_executor.determine_available_memory()
+        # TODO(liyi): Modified to determine how to initialize kv cache
+        available_cpu_memory = self.model_executor.determine_available_memory()
 
         # Get the kv cache tensor size
         kv_cache_configs = get_kv_cache_configs(vllm_config, kv_cache_specs,
-                                                available_gpu_memory)
+                                                available_cpu_memory)
         num_gpu_blocks_set = set(config.num_blocks
                                  for config in kv_cache_configs)
         assert len(num_gpu_blocks_set) == 1, (

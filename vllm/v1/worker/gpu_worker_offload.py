@@ -133,93 +133,19 @@ class WorkerOffload(WorkerBase):
         with context:
             self.model_runner.load_model()
 
-    # @torch.inference_mode()
-    # def determine_available_memory(self) -> int:
-    #     """Profiles the peak memory usage of the model to determine how much 
-    #     memory can be used for KV cache without OOMs.
-
-    #     The engine will first conduct a profiling of the existing memory usage.
-    #     Then, it calculate the free memory that can be used for KV cache in
-    #     bytes.
-
-    #     .. tip::
-    #         You may limit the usage of GPU memory
-    #         by adjusting the `gpu_memory_utilization` parameter.
-    #     """
-    #     torch.cuda.empty_cache()
-    #     torch.cuda.reset_peak_memory_stats()
-
-    #     _, total_gpu_memory = torch.cuda.mem_get_info()
-    #     # Execute a forward pass with dummy inputs to profile the memory usage
-    #     # of the model.
-    #     self.model_runner.profile_run()
-
-    #     free_gpu_memory, _ = torch.cuda.mem_get_info()
-    #     # NOTE(woosuk): Here we assume that the other processes using the same
-    #     # GPU did not change their memory usage during the profiling.
-    #     assert self.init_gpu_memory > free_gpu_memory, (
-    #         "Error in memory profiling. "
-    #         f"Initial free memory {self.init_gpu_memory}, current free memory"
-    #         f" {free_gpu_memory}. This happens when the GPU memory was "
-    #         "not properly cleaned up before initializing the vLLM instance.")
-
-    #     # Get the peak memory allocation recorded by torch
-    #     peak_memory = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-
-    #     # Check for any memory left around that may have been allocated on the
-    #     # gpu outside of `torch`. NCCL operations, for example, can use a few
-    #     # GB during a forward pass
-    #     torch.cuda.empty_cache()
-    #     torch_allocated_bytes = torch.cuda.memory_stats(
-    #     )["allocated_bytes.all.current"]
-    #     total_allocated_bytes = torch.cuda.mem_get_info(
-    #     )[1] - torch.cuda.mem_get_info()[0]
-    #     non_torch_allocations = total_allocated_bytes - torch_allocated_bytes
-    #     if non_torch_allocations > 0:
-    #         peak_memory += non_torch_allocations
-    #     available_kv_cache_memory = (
-    #         total_gpu_memory * self.cache_config.gpu_memory_utilization -
-    #         peak_memory)
-
-    #     return int(available_kv_cache_memory)
-
-    # def get_kv_cache_spec(self) -> KVCacheSpec:
-    #     return self.model_runner.get_kv_cache_spec()
-
-    # def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
-    #     """Allocate GPU KV cache with the specified kv_cache_config."""
-    #     if self.vllm_config.model_config.enable_sleep_mode:
-    #         allocator = CuMemAllocator.get_instance()
-    #         context = allocator.use_memory_pool(tag="kv_cache")
-    #     else:
-    #         from contextlib import nullcontext
-    #         context = nullcontext()
-    #     with context:
-    #         self.model_runner.initialize_kv_cache(kv_cache_config)
-
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        mem_before = psutil.virtual_memory()
-        total_cpu_memory = mem_before.total
-        free_cpu_memory_before = mem_before.available
-
-        self.model_runner.profile_run()
-
-        mem_after = psutil.virtual_memory()
-        free_cpu_memory_after = mem_after.available
-
-        profile_peak_usage = free_cpu_memory_before - free_cpu_memory_after
-
-        available_kv_cache_memory = \
-            total_cpu_memory * self.cache_config.cpu_memory_utilization \
-            - profile_peak_usage
-
-        return int(available_kv_cache_memory)
+        # NOTE(liyi): We may not need to know the available cpu memory
+        # for offload workers, but gpu_memory_available is still required
+        # to maximize the memory usage and for adaptive preemption/offloading.
+        raise NotImplementedError("determine vailable memory is not implemented"
+                                  " for offload workers.")
 
     def get_kv_cache_spec(self) -> KVCacheSpec:
         return self.model_runner.get_kv_cache_spec()
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        # NOTE(liyi): Simply copied from GPU ver.
         from contextlib import nullcontext
         with nullcontext():
             self.model_runner.initialize_kv_cache(kv_cache_config)
