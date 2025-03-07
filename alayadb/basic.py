@@ -5,7 +5,7 @@ import vllm.logger
 import os
 
 os.environ["VLLM_USE_V1"] = "1"
-# os.environ["VLLM_USE_SPARSE_OFFLOAD"] = 1
+os.environ["VLLM_USE_SPARSE_OFFLOAD"] = "1"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.makedirs("logs", exist_ok=True)
 
@@ -23,7 +23,7 @@ prompts = [
 sampling_params = SamplingParams(temperature=0.8, top_p=0.95)
 
 # Create an LLM.
-model = "meta-llama/Meta-Llama-3-8B-Instruct"
+model = "meta-llama/Llama-3.2-1B-Instruct"
 llm = LLM(model=model, enforce_eager=True, gpu_memory_utilization=0.7)
 
 # Generate texts from the prompts. The output is a list of RequestOutput objects

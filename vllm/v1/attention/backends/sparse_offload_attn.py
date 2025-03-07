@@ -40,7 +40,7 @@ class SparseOffloadAttentionBackend(AttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> List[int]:
         # TODO: check other sizes
-        return [128]
+        return [64]
 
     @staticmethod
     def get_name() -> str:
@@ -209,6 +209,7 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor,
         attn_metadata: SparseOffloadAttentionMetadata,
+        layer_name: str,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with SparseOffloadAttention.
@@ -241,7 +242,9 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         # NOTE(liyi): Here we may not change the slot_mapping, cause full
         # kv_cache is stored as origin. We only select crucial kv blocks
         # for each req and rebuild a block_table for varlen_flash_attn.
-        torch.ops._C_cache_ops.reshape_and_cache_flash(
+        # TODO: how to get the context_manager in model_runner
+        self.context_manager.update_kvcache(
+            layer_name,
             key,
             value,
             key_cache,
