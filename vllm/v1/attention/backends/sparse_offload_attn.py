@@ -82,6 +82,7 @@ class SparseOffloadAttentionMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor 
     slot_mapping: torch.Tensor
+    layer_name: str
 
     # TODO: for cascade attention
 
@@ -202,7 +203,6 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         value: torch.Tensor,
         kv_cache: torch.Tensor, # TODO: check
         attn_metadata: SparseOffloadAttentionMetadata,
-        layer_name: str, # TODO: check
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Forward pass with SparseOffloadAttention.
@@ -236,7 +236,7 @@ class SparseOffloadAttentionImpl(AttentionImpl):
 
         # TODO: how to get the context_manager in model_runner
         self.context_manager.update_kvcache(
-            layer_name,
+            attn_metadata.layer_name,
             key,
             value,
             attn_metadata.slot_mapping,
@@ -247,7 +247,7 @@ class SparseOffloadAttentionImpl(AttentionImpl):
 
         key_cache, value_cache, sparse_block_table, sparse_seqlens_k = \
             self.context_manager.load_kvcache(
-                layer_name=layer_name,
+                layer_name= attn_metadata.layer_name,
                 query=query,
                 cu_seqlens_q=attn_metadata.query_start_loc,
                 seqlens_k=attn_metadata.seq_lens,
