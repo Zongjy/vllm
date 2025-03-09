@@ -31,7 +31,7 @@ vllm_logger.setLevel(logging.DEBUG)  # 更详细的日志级别
 # 初始化 rich console
 console = Console()
 
-model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+model_name = "meta-llama/Llama-3.2-1B-Instruct"
 
 
 # 加载本地模型

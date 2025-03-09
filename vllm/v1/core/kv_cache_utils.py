@@ -556,7 +556,7 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
 def get_kv_cache_configs(vllm_config: VllmConfig,
                          kv_cache_specs: List[KVCacheSpec],
                          available_gpu_memory: int,
-                         available_cpu_memory) -> List[KVCacheConfig]:
+                         available_cpu_memory = None) -> List[KVCacheConfig]:
     """
     Generates the KV cache configuration for a model
     TODO: support hybrid models with more than one type of KV cache.
@@ -575,14 +575,14 @@ def get_kv_cache_configs(vllm_config: VllmConfig,
     kv_cache_configs = []
     for kv_cache_spec in kv_cache_specs:
         check_enough_kv_cache_memory(vllm_config, kv_cache_spec,
-                                     available_memory)
+                                     available_gpu_memory)
         if is_kv_cache_type_uniform(kv_cache_spec):
             # KV cache of all layers are the same, which is true for
             # most models. Allocate the same amount of memory for
             # each layer.
             kv_cache_configs.append(
                 _get_kv_cache_config_uniform_type(vllm_config, kv_cache_spec,
-                                                  available_memory,
+                                                  available_gpu_memory,
                                                   num_layers))
         else:
             raise NotImplementedError
