@@ -80,7 +80,7 @@ class SparseOffloadAttentionMetadata:
     query_start_loc: torch.Tensor
     max_seq_len: int
     seq_lens: torch.Tensor
-    block_table: torch.Tensor 
+    block_table: torch.Tensor
     slot_mapping: torch.Tensor
     layer_name: str
 
@@ -194,14 +194,13 @@ class SparseOffloadAttentionImpl(AttentionImpl):
 
         self.vllm_flash_attn_version = get_flash_attn_version()
 
-
     def forward(
         self,
         layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        kv_cache: torch.Tensor, # TODO: check
+        kv_cache: torch.Tensor,  # TODO: check
         attn_metadata: SparseOffloadAttentionMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
@@ -245,9 +244,9 @@ class SparseOffloadAttentionImpl(AttentionImpl):
             layer._v_scale,
         )
 
-        key_cache, value_cache, sparse_block_table, sparse_seqlens_k = \
+        key_cache, value_cache, sparse_block_table, sparse_seqlens_k = (
             self.context_manager.load_kvcache(
-                layer_name= attn_metadata.layer_name,
+                layer_name=attn_metadata.layer_name,
                 query=query,
                 cu_seqlens_q=attn_metadata.query_start_loc,
                 seqlens_k=attn_metadata.seq_lens,
@@ -255,6 +254,7 @@ class SparseOffloadAttentionImpl(AttentionImpl):
                 sliding_window=self.sliding_window,
                 gpu_device=self.device,
             )
+        )
 
         flash_attn_varlen_func(
             q=query[:num_actual_tokens],

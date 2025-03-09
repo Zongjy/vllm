@@ -1,7 +1,10 @@
 import torch
 
 from vllm.config import VllmConfig
-from vllm.v1.kv_cache_interface import (FullAttentionSpec, KVCacheConfig,)
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+)
 from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
 from vllm.model_executor.models.utils import extract_layer_index
 from collections import defaultdict
@@ -24,8 +27,10 @@ class KVCacheContextManager:
     def _initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         # TODO(liyi): Check
         if len(kv_cache_config.groups) > 1:
-            raise NotImplementedError("Hybrid models with more than one KV"
-                                      "cache type are not supported yet.")
+            raise NotImplementedError(
+                "Hybrid models with more than one KV"
+                "cache type are not supported yet."
+            )
 
         for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
             tensor_config = kv_cache_config.tensors[layer_name]
@@ -33,12 +38,15 @@ class KVCacheContextManager:
             num_blocks = tensor_config.size // layer_spec.page_size_bytes
             if isinstance(layer_spec, FullAttentionSpec):
                 kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
-                    num_blocks, layer_spec.block_size, layer_spec.num_kv_heads,
-                    layer_spec.head_size)
+                    num_blocks,
+                    layer_spec.block_size,
+                    layer_spec.num_kv_heads,
+                    layer_spec.head_size,
+                )
                 dtype = layer_spec.dtype
-                self.kv_cache_dict[layer_name] = torch.zeros(kv_cache_shape,
-                                                             dtype=dtype,
-                                                             device=self.device)
+                self.kv_cache_dict[layer_name] = torch.zeros(
+                    kv_cache_shape, dtype=dtype, device=self.device
+                )
             else:
                 raise NotImplementedError
 
@@ -60,12 +68,12 @@ class KVCacheContextManager:
             forward_ctx[layer_name].kv_cache = [kv_cache]
 
     def update_kvcache(
-            self, 
-            layer_name: str, 
-            key: torch.Tensor, 
-            value: torch.Tensor, 
-            slot_mapping: torch.Tensor,
-            ) -> None:
+        self,
+        layer_name: str,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
         """
         Update the kv cache with the given slot mapping.
         """
@@ -76,17 +84,16 @@ class KVCacheContextManager:
         slot_mapping = slot_mapping.to(self.device)
         kv_cache[:, slot_mapping, :] = torch.stack((k, v))
 
-
     def load_kvcache(
-            self, 
-            layer_name: str,
-            query: torch.Tensor,
-            cu_seqlens_q: torch.Tensor,
-            seqlens_k: torch.Tensor,
-            block_table: torch.Tensor,
-            sliding_window: Optional[int],
-            gpu_device: torch.device
-        ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        self,
+        layer_name: str,
+        query: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        seqlens_k: torch.Tensor,
+        block_table: torch.Tensor,
+        sliding_window: Optional[int],
+        gpu_device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # NOTE(liyi): Move the selection process inside context manager.
         key_cache, value_cache = self.kv_cache_dict[layer_name].unbind(0)
 
@@ -103,8 +110,8 @@ class KVCacheContextManager:
         key_cache = key_cache.to(gpu_device)
         value_cache = value_cache.to(gpu_device)
         return (key_cache, value_cache, sparse_block_table, sparse_seqlens_k)
-                
-    
+
+
 def varlen_sparse_kv_selection(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -114,7 +121,7 @@ def varlen_sparse_kv_selection(
     seqlens_k: torch.Tensor,
     block_table: torch.Tensor,
     topk: int,
-    sliding_window: Optional[int]
+    sliding_window: Optional[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
 
@@ -153,30 +160,31 @@ def varlen_sparse_kv_selection(
         k_len = seqlens_k[seq_idx].item()
 
         # NOTE(yangshen):
-        # Since the FlashAttention only supports right align the 
+        # Since the FlashAttention only supports right align the
         # causal masks. We will not drop any blocks with query on it.
         # https://github.com/Dao-AILab/flash-attention?tab=readme-ov-file#how-to-use-flashattention
         # NOTE(liyi): Apply sliding_window here
         # block table:
         # before: | < sink > |     < sparse >     |  < max(local, full) >  |
         # after:  | < sink > |  < select > |  < max(local, full) > |
-        num_sink_blks, num_local_blks = \
+        num_sink_blks, num_local_blks = (
             sliding_window if sliding_window else (0, 0)
+        )
         num_seq_blks = cdiv(k_len, block_size)
         num_local_blks = max(
-            cdiv(q_len, block_size),  
+            cdiv(q_len, block_size),
             num_local_blks,
-        )   # blocks for local attention
+        )  # blocks for local attention
         num_sparse_blks = (
             num_seq_blks - num_sink_blks - num_local_blks
-        )   # blocks for sparse attention
+        )  # blocks for sparse attention
         if num_sparse_blks == 0 or num_sparse_blks <= topk:
             continue
 
         # select the blocks
         k_blks_idx = block_table[
-            seq_idx, 
-            num_sink_blks : num_sink_blks + num_sparse_blks]
+            seq_idx, num_sink_blks : num_sink_blks + num_sparse_blks
+        ]
         k_blks = key_cache[
             k_blks_idx
         ]  # [num_sparse_blocks, block_size, num_kv_heads, head_size]
@@ -204,21 +212,23 @@ def varlen_sparse_kv_selection(
         num_sel_blks = sel_blks_idx.numel()
         new_block_table[seq_idx, :num_sink_blks] = block_table[
             seq_idx, :num_sink_blks
-        ] # sink blocks
-        
-        new_block_table[
-            seq_idx, num_sink_blks : num_sink_blks + num_sel_blks
-        ] = block_table[seq_idx, sel_blks_idx] # selected blocks
+        ]  # sink blocks
 
         new_block_table[
-            seq_idx, 
-            num_sink_blks + num_sel_blks : \
-                num_sink_blks + num_sel_blks + num_local_blks
+            seq_idx, num_sink_blks : num_sink_blks + num_sel_blks
+        ] = block_table[seq_idx, sel_blks_idx]  # selected blocks
+
+        new_block_table[
+            seq_idx,
+            num_sink_blks + num_sel_blks : num_sink_blks
+            + num_sel_blks
+            + num_local_blks,
         ] = block_table[
-            seq_idx, 
-            num_sink_blks + num_sparse_blks : \
-                num_sink_blks + num_sparse_blks + num_local_blks
-        ] # local block
+            seq_idx,
+            num_sink_blks + num_sparse_blks : num_sink_blks
+            + num_sparse_blks
+            + num_local_blks,
+        ]  # local block
 
         new_seq_lens_k[seq_idx] = (
             k_len - (num_sparse_blks - num_sel_blks) * block_size
