@@ -1093,6 +1093,9 @@ class CacheConfig:
         enable_prefix_caching: bool = False,
         cpu_offload_gb: float = 0,
         calculate_kv_scales: Optional[bool] = None,
+        # NOTE(liyi): params for sparse attention offload
+        # sparse_lower_bound: Optional[int] = None,
+        sparse_top_k: Optional[int] = 4,
     ) -> None:
         self.block_size = block_size
         self.gpu_memory_utilization = gpu_memory_utilization

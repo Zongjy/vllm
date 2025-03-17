@@ -325,9 +325,6 @@ def unified_attention(
     forward_context: ForwardContext = get_forward_context()
     attn_metadata = forward_context.attn_metadata
     self = forward_context.attn_layers[layer_name]
-    if envs.VLLM_USE_SPARSE_OFFLOAD:
-        attn_metadata.layer_name = layer_name
-    # NOTE(liyi): if use offload, kvcache will be not used
     kv_cache = self.kv_cache[forward_context.virtual_engine]
     return self.impl.forward(self, query, key, value, kv_cache, attn_metadata)
 
@@ -361,13 +358,15 @@ def unified_attention_with_output(
     attn_metadata = forward_context.attn_metadata
     self = forward_context.attn_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
+    if envs.VLLM_USE_SPARSE_OFFLOAD:
+        attn_metadata.layer_name = layer_name
+    # NOTE(liyi): if use offload, kvcache will be not used
     self.impl.forward(self,
                       query,
                       key,
                       value,
                       kv_cache,
                       attn_metadata,
-                    #   layer_name,
                       output=output)
 
 

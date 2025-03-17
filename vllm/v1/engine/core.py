@@ -96,7 +96,8 @@ class EngineCore:
 
         # Profiles the peak memory usage of the model to determine how much
         # memory can be allocated for kv cache.
-        # TODO(liyi): Modified to determine how to initialize kv cache
+
+        # TODO(liyi): Refactor for SAO
         available_gpu_memory = self.model_executor.determine_available_memory()
 
         # Get the kv cache tensor size

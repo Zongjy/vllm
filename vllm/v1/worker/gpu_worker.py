@@ -186,6 +186,7 @@ class Worker(WorkerBase):
         return self.model_runner.get_kv_cache_spec()
 
     def initialize_from_config(self, kv_cache_config: KVCacheConfig) -> None:
+        #? Why here is KVCacheConfig but List[..] in Core?
         """Allocate GPU KV cache with the specified kv_cache_config."""
         if self.vllm_config.model_config.enable_sleep_mode:
             allocator = CuMemAllocator.get_instance()

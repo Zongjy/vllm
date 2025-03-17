@@ -5,10 +5,11 @@ from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
 )
-from vllm.v1.attention.backends.flash_attn import FlashAttentionBackend
+from vllm.v1.attention.backends.sparse_offload_attn import SparseOffloadAttentionBackend
 from vllm.model_executor.models.utils import extract_layer_index
 from collections import defaultdict
 from vllm.utils import cdiv
+from vllm.v1.core.memory_pool import MemoryPool
 from typing import Optional, Dict, List, Tuple
 
 
@@ -16,42 +17,54 @@ class KVCacheContextManager:
     # TODO(liyi): Unified with KVCacheManager for:
     # 1. token_budget calculation
     # 2. LRU policy for swapping kvcache blocks
-    def __init__(self, vllm_config: VllmConfig):
+    def __init__(self, vllm_config: VllmConfig, device: torch.device="cuda"):
         self.vllm_config = vllm_config
-        self.device = torch.device("cpu")
-        self.kv_caches: List[torch.Tensor] = []
-        self.kv_cache_dict: Dict[str, torch.Tensor] = {}
+        self.device = device
+        # self.kv_caches: List[torch.Tensor] = []
+        # self.kv_cache_dict: Dict[str, torch.Tensor] = {}
+
+        # NOTE(liyi): Lazy initialization after model_runner loads the model
+        self.cpu_pool = None
+        self.gpu_pool = None
         # TODO: the underlying are sparse attention parameters, we fix it now
         self.topk = 4
 
     def _initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        # TODO(liyi): Check
+        # self.kv_cache_config = kv_cache_config
+
         if len(kv_cache_config.groups) > 1:
             raise NotImplementedError(
-                "Hybrid models with more than one KV"
-                "cache type are not supported yet."
-            )
+                "Hybrid models with more than one KV cache type are not "
+                "supported yet.")
 
+        self.cpu_pool: Dict[str, torch.Tensor] = {}
+        total_blocks = 0
         for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
             tensor_config = kv_cache_config.tensors[layer_name]
             assert tensor_config.size % layer_spec.page_size_bytes == 0
             num_blocks = tensor_config.size // layer_spec.page_size_bytes
+            total_blocks += num_blocks
             if isinstance(layer_spec, FullAttentionSpec):
-                kv_cache_shape = FlashAttentionBackend.get_kv_cache_shape(
-                    num_blocks,
-                    layer_spec.block_size,
-                    layer_spec.num_kv_heads,
-                    layer_spec.head_size,
-                )
+                kv_cache_shape = (2, num_blocks, layer_spec.block_size, 
+                                layer_spec.num_kv_heads, layer_spec.head_size)
                 dtype = layer_spec.dtype
-                self.kv_cache_dict[layer_name] = torch.zeros(
-                    kv_cache_shape, dtype=dtype, device=self.device
-                )
+                self.cpu_pool[layer_name] = torch.zeros(kv_cache_shape,
+                                                    dtype=dtype,
+                                                    device="cpu")
             else:
-                raise NotImplementedError
+                raise NotImplementedError 
+
+        kv_cache_shape = (2, total_blocks, layer_spec.block_size,
+                            layer_spec.num_kv_heads, layer_spec.head_size)
+        self.gpu_pool = torch.zeros(kv_cache_shape, 
+                                    dtype=dtype, 
+                                    device=self.device)
 
     def _bind_kv_cache(self) -> None:
-        # TODO: Check
+        # TODO(liyi): Is it nessary to bind the kv cache to the ctx?
+        # Now we update & load kv_cache via ctx_manager (and memory_pool).
+        # Perhaps attn_impl only needs the addr of unified gpu cache to access
+        # the loaded crucial blocks.
         index2name = defaultdict(list)
         for layer_name in self.kv_cache_dict:
             index2name[extract_layer_index(layer_name)].append(layer_name)
@@ -94,7 +107,6 @@ class KVCacheContextManager:
         sliding_window: Optional[int],
         gpu_device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # NOTE(liyi): Move the selection process inside context manager.
         key_cache, value_cache = self.kv_cache_dict[layer_name].unbind(0)
 
         sparse_block_table, sparse_seqlens_k = varlen_sparse_kv_selection(

@@ -124,7 +124,7 @@ class SparseOffloadAttentionMetadataBuilder:
             .long()
         )
 
-        # we do not support the cascade attention ye
+        # we do not support the cascade attention yet
         # use_cascade = False
         # cu_prefix_query_lens = None
         # prefix_kv_lens = None

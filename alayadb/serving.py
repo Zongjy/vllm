@@ -42,7 +42,10 @@ vllm_logger.info(
 
 try:
     llm = LLM(
-        model=f"{model_name}", max_model_len=16384, gpu_memory_utilization=0.5
+        model=f"{model_name}", 
+        max_model_len=16384,
+        enforce_eager=True,
+        gpu_memory_utilization=0.5
     )
     vllm_logger.info("模型加载成功")
 except Exception as e:
