@@ -9,7 +9,7 @@ from vllm.v1.attention.backends.sparse_offload_attn import SparseOffloadAttentio
 from vllm.model_executor.models.utils import extract_layer_index
 from collections import defaultdict
 from vllm.utils import cdiv
-from vllm.v1.core.memory_pool import MemoryPool
+from vllm.v1.core.memory_pool import UnifiedMemoryCache
 from typing import Optional, Dict, List, Tuple
 
 
@@ -24,61 +24,48 @@ class KVCacheContextManager:
         # self.kv_cache_dict: Dict[str, torch.Tensor] = {}
 
         # NOTE(liyi): Lazy initialization after model_runner loads the model
-        self.cpu_pool = None
-        self.gpu_pool = None
+        self.kv_cache = None
         # TODO: the underlying are sparse attention parameters, we fix it now
         self.topk = 4
 
     def _initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        # self.kv_cache_config = kv_cache_config
-
+        self.layer2index = {}
         if len(kv_cache_config.groups) > 1:
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
-
-        self.cpu_pool: Dict[str, torch.Tensor] = {}
         total_blocks = 0
+        first_layer_spec = kv_cache_config[
+            kv_cache_config.kv_cache_spec.keys()[0]]
+        kv_cache_shape = (
+            first_layer_spec.block_size,
+            first_layer_spec.num_kv_heads,
+            first_layer_spec.head_size,
+        )
+        dtype = first_layer_spec.dtype
+
         for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
             tensor_config = kv_cache_config.tensors[layer_name]
             assert tensor_config.size % layer_spec.page_size_bytes == 0
             num_blocks = tensor_config.size // layer_spec.page_size_bytes
+
+            # NOTE(liyi): Here we assume each layer has the same kv cache shape
+            assert isinstance(layer_spec, FullAttentionSpec)
+            assert layer_spec.dtype == first_layer_spec.dtype
+            assert layer_spec.block_size == first_layer_spec.block_size
+            assert layer_spec.num_kv_heads == first_layer_spec.num_kv_heads
+            assert layer_spec.head_size == first_layer_spec.head_size
+            
+            self.layer2index[layer_name] = (total_blocks, 
+                                            total_blocks + num_blocks)
             total_blocks += num_blocks
-            if isinstance(layer_spec, FullAttentionSpec):
-                kv_cache_shape = (2, num_blocks, layer_spec.block_size, 
-                                layer_spec.num_kv_heads, layer_spec.head_size)
-                dtype = layer_spec.dtype
-                self.cpu_pool[layer_name] = torch.zeros(kv_cache_shape,
-                                                    dtype=dtype,
-                                                    device="cpu")
-            else:
-                raise NotImplementedError 
 
-        kv_cache_shape = (2, total_blocks, layer_spec.block_size,
-                            layer_spec.num_kv_heads, layer_spec.head_size)
-        self.gpu_pool = torch.zeros(kv_cache_shape, 
-                                    dtype=dtype, 
-                                    device=self.device)
-
-    def _bind_kv_cache(self) -> None:
-        # TODO(liyi): Is it nessary to bind the kv cache to the ctx?
-        # Now we update & load kv_cache via ctx_manager (and memory_pool).
-        # Perhaps attn_impl only needs the addr of unified gpu cache to access
-        # the loaded crucial blocks.
-        index2name = defaultdict(list)
-        for layer_name in self.kv_cache_dict:
-            index2name[extract_layer_index(layer_name)].append(layer_name)
-
-        for layer_index in sorted(index2name.keys()):
-            layer_names = index2name[layer_index]
-            if len(layer_names) > 1:
-                raise NotImplementedError
-            layer_name = layer_names[0]
-            self.kv_caches.append(self.kv_cache_dict[layer_name])
-
-        forward_ctx = self.vllm_config.compilation_config.static_forward_context
-        for layer_name, kv_cache in self.kv_cache_dict.items():
-            forward_ctx[layer_name].kv_cache = [kv_cache]
+        self.kv_cache = UnifiedMemoryCache(
+            kv_cache_shape, 
+            total_blocks, # num cpu blocks
+            total_blocks, # num gpu blocks
+            dtype,
+            )
 
     def update_kvcache(
         self,
@@ -88,14 +75,14 @@ class KVCacheContextManager:
         slot_mapping: torch.Tensor,
     ) -> None:
         """
-        Update the kv cache with the given slot mapping.
+            Update the kv cache with the given slot mapping.
         """
-        # NOTE(liyi): Needs LRU to offload kvcache blocks
-        kv_cache = self.kv_cache_dict[layer_name]
+        offset = self.layer2index[layer_name][0]
         k = key.to(self.device)
         v = value.to(self.device)
         slot_mapping = slot_mapping.to(self.device)
-        kv_cache[:, slot_mapping, :] = torch.stack((k, v))
+        # TODO: deal with incomplete blocks
+        self.kv_cache.put(offset, k, v, slot_mapping)
 
     def load_kvcache(
         self,
@@ -107,7 +94,13 @@ class KVCacheContextManager:
         sliding_window: Optional[int],
         gpu_device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        key_cache, value_cache = self.kv_cache_dict[layer_name].unbind(0)
+        """
+            Load kv cache for the given layer with sparse selection.
+        """
+        # key_cache, value_cache = self.kv_cache_dict[layer_name].unbind(0)
+        # TODO: unclear about func `get` in UnifiedMemoryCache
+        layer_range = slice(*self.layer2index[layer_name])
+        key_cache = self.kv_cache.cpu_blocks[0, layer_range, :, :, :]
 
         sparse_block_table, sparse_seqlens_k = varlen_sparse_kv_selection(
             query.to(self.device),
@@ -118,10 +111,9 @@ class KVCacheContextManager:
             topk=self.topk,
             sliding_window=sliding_window,
         )
-        # TODO(liyi): Swap in and add LRU policy to control kvcache blocks
-        key_cache = key_cache.to(gpu_device)
-        value_cache = value_cache.to(gpu_device)
-        return (key_cache, value_cache, sparse_block_table, sparse_seqlens_k)
+        # swap in the selected blocks
+
+        raise NotImplementedError("TODO: swap in the selected blocks")
 
 
 def varlen_sparse_kv_selection(
@@ -136,26 +128,18 @@ def varlen_sparse_kv_selection(
     sliding_window: Optional[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+        Simply modified from
+            - vllm.tests.test_flash_attn.ref_paged_attn &
+            - https://github.com/MoonshotAI/MoBA/blob/master/moba/moba_naive.py#L7
+        to select crucial kv blocks for each req by:
+            1. estimate score by matmul(q, mean_pooling(k.T)) [Snapkv, MoBA]
+            2. select top-k scores
+        And 
+            - It do sparse only for decode.
+            - It specify the blocks by returning a new block_table and
+                cu_seqlens_k to flash_attention.
 
-    NOTE(liyi) simply modified from
-        - vllm.tests.test_flash_attn.ref_paged_attn &
-        - https://github.com/MoonshotAI/MoBA/blob/master/moba/moba_naive.py#L7
-    to select crucial kv blocks for each req by:
-        1. estimate score by matmul(q, mean_pooling(k.T)) [Snapkv, MoBA]
-        2. select top-k scores
-    Here, we should calculate the gate in CPU, and then
-    swap the selected kv blocks to GPU.
-
-    return: block_table, seq_lens_k
-    -------------------------------
-    NOTE(yangshen)
-    We are implementing a simple mean-pooling based
-        block selection inside GPU now.
-    - It do sparse only for decode.
-    - It specify the blocks by returning a new block_table and
-        cu_seqlens_k to flash_attention.
-
-    Then we will move to InfLLM, CPU offloading and chunked prefill.
+        return: block_table, seq_lens_k
     """
 
     num_seqs = cu_seqlens_q.numel() - 1
