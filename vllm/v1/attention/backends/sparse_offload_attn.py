@@ -234,7 +234,7 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         # key_cache, value_cache = kv_cache.unbind(0)
 
         # TODO: how to get the context_manager in model_runner
-        self.context_manager.update_kvcache(
+        self.runner.context_manager.update_kvcache(
             attn_metadata.layer_name,
             key,
             value,
@@ -245,7 +245,7 @@ class SparseOffloadAttentionImpl(AttentionImpl):
         )
 
         key_cache, value_cache, sparse_block_table, sparse_seqlens_k = (
-            self.context_manager.load_kvcache(
+            self.runner.context_manager.load_kvcache(
                 layer_name=attn_metadata.layer_name,
                 query=query,
                 cu_seqlens_q=attn_metadata.query_start_loc,

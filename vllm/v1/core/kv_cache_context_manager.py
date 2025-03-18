@@ -20,13 +20,11 @@ class KVCacheContextManager:
     def __init__(self, vllm_config: VllmConfig, device: torch.device="cuda"):
         self.vllm_config = vllm_config
         self.device = device
-        # self.kv_caches: List[torch.Tensor] = []
-        # self.kv_cache_dict: Dict[str, torch.Tensor] = {}
-
         # NOTE(liyi): Lazy initialization after model_runner loads the model
         self.kv_cache = None
         # TODO: the underlying are sparse attention parameters, we fix it now
         self.topk = 4
+        # Track the current block and position for each layer
 
     def _initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.layer2index = {}
@@ -34,9 +32,10 @@ class KVCacheContextManager:
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
                 "supported yet.")
-        total_blocks = 0
+        
+        # Get the first layer's spec to determine shared parameters
         first_layer_spec = kv_cache_config[
-            kv_cache_config.kv_cache_spec.keys()[0]]
+            list(kv_cache_config.kv_cache_spec.keys())[0]]
         kv_cache_shape = (
             first_layer_spec.block_size,
             first_layer_spec.num_kv_heads,
@@ -44,45 +43,48 @@ class KVCacheContextManager:
         )
         dtype = first_layer_spec.dtype
 
+        # Calculate num_blocks for each layer
+        num_cpu_blocks = {}
         for layer_name, layer_spec in kv_cache_config.kv_cache_spec.items():
             tensor_config = kv_cache_config.tensors[layer_name]
             assert tensor_config.size % layer_spec.page_size_bytes == 0
             num_blocks = tensor_config.size // layer_spec.page_size_bytes
 
-            # NOTE(liyi): Here we assume each layer has the same kv cache shape
+            # Verify all layers have same shape
             assert isinstance(layer_spec, FullAttentionSpec)
             assert layer_spec.dtype == first_layer_spec.dtype
             assert layer_spec.block_size == first_layer_spec.block_size
             assert layer_spec.num_kv_heads == first_layer_spec.num_kv_heads
             assert layer_spec.head_size == first_layer_spec.head_size
             
-            self.layer2index[layer_name] = (total_blocks, 
-                                            total_blocks + num_blocks)
-            total_blocks += num_blocks
+            num_cpu_blocks[layer_name] = num_blocks
+            self.current_block_info[layer_name] = (0, 0)  # (block_id, position)
 
+        # Initialize UnifiedMemoryCache with layer-specific CPU blocks
+        total_blocks = sum(num_cpu_blocks.values())
         self.kv_cache = UnifiedMemoryCache(
-            kv_cache_shape, 
-            total_blocks, # num cpu blocks
-            total_blocks, # num gpu blocks
-            dtype,
-            )
+            cache_shape=kv_cache_shape,
+            num_cpu_blocks=num_cpu_blocks,
+            num_gpu_blocks=total_blocks // 2,
+            num_streams=4,
+        )
 
     def update_kvcache(
         self,
         layer_name: str,
         key: torch.Tensor,
         value: torch.Tensor,
+        block_table: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
         """
-            Update the kv cache with the given slot mapping.
+        Update the kv cache with the given slot mapping & block_table.
+        The key and value are for a single token, and need to be stored in the current block.
         """
-        offset = self.layer2index[layer_name][0]
-        k = key.to(self.device)
-        v = value.to(self.device)
-        slot_mapping = slot_mapping.to(self.device)
-        # TODO: deal with incomplete blocks
-        self.kv_cache.put(offset, k, v, slot_mapping)
+        if layer_name not in self.current_block_info:
+            raise ValueError(f"Layer {layer_name} not initialized")
+
+        raise NotImplementedError
 
     def load_kvcache(
         self,
@@ -95,13 +97,24 @@ class KVCacheContextManager:
         gpu_device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-            Load kv cache for the given layer with sparse selection.
+        Load kv cache for the given layer with sparse selection.
+        Returns: (gpu_block_table, kvcache_k, kvcache_v, sparse_seqlens_k)
         """
-        # key_cache, value_cache = self.kv_cache_dict[layer_name].unbind(0)
-        # TODO: unclear about func `get` in UnifiedMemoryCache
-        layer_range = slice(*self.layer2index[layer_name])
-        key_cache = self.kv_cache.cpu_blocks[0, layer_range, :, :, :]
+        # NOTE(liyi): need fix
+        # First get the blocks from CPU
+        cpu_blocks = []
+        for block_id in block_table.unique():
+            block = self.kv_cache.get(block_id, target="cpu", layer_name=layer_name)
+            if block is not None:
+                cpu_blocks.append(block)
 
+        if not cpu_blocks:
+            raise ValueError(f"No blocks found for layer {layer_name}")
+
+        # Stack blocks into a single tensor for sparse selection
+        key_cache = torch.stack(cpu_blocks, dim=0)
+
+        # Perform sparse selection
         sparse_block_table, sparse_seqlens_k = varlen_sparse_kv_selection(
             query.to(self.device),
             key_cache,
@@ -111,9 +124,31 @@ class KVCacheContextManager:
             topk=self.topk,
             sliding_window=sliding_window,
         )
-        # swap in the selected blocks
 
-        raise NotImplementedError("TODO: swap in the selected blocks")
+        # Transfer selected blocks to GPU
+        gpu_blocks = []
+        gpu_block_mapping = {}  # old_block_id -> new_gpu_block_id
+        for i, block_id in enumerate(sparse_block_table.unique()):
+            block = self.kv_cache.get(block_id, target="cpu", layer_name=layer_name)
+            if block is None:
+                raise ValueError(f"Block {block_id} not found in layer {layer_name}")
+            
+            # Move block to GPU
+            gpu_block = block.to(gpu_device)
+            self.kv_cache.put(i, gpu_block, target="gpu")
+            gpu_blocks.append(gpu_block)
+            gpu_block_mapping[block_id.item()] = i
+
+        # Create new GPU block table
+        gpu_block_table = torch.tensor([gpu_block_mapping[bid.item()] 
+                                      for bid in sparse_block_table.flatten()],
+                                     device=gpu_device).view_as(sparse_block_table)
+
+        # Stack GPU blocks into key and value caches
+        kvcache = torch.stack(gpu_blocks, dim=0)  # [num_blocks, block_size, num_heads, head_size]
+        kvcache_k, kvcache_v = kvcache.unbind(0)  # Split into key and value caches
+
+        return gpu_block_table, kvcache_k, kvcache_v, sparse_seqlens_k
 
 
 def varlen_sparse_kv_selection(
