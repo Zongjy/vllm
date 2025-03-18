@@ -1,14 +1,48 @@
 import torch
 import torch.cuda
+from typing import Optional
 
 
 class UnifiedMemoryCache:
+    gpu_device: torch.device
+    cache_shape: torch.Size
+    # each layer have number of cpu blocks
+    layer_names: list[str]
+    num_cpu_blocks: int
+    num_gpu_blocks: int
+
+    # use multiple cuda stream to accelerate memory transfer
+    num_streams: int
+    streams: list[torch.cuda.Stream]
+    current_stream: int
+
+    # lru related
+    cpu_blocks: dict[str, torch.Tensor]
+    cpu_block_usage: dict[str, torch.Tensor]
+    gpu_blocks: torch.Tensor
+    gpu_block_usage: torch.Tensor
+    gpu_lru: list[int]
+    pinned_blocks: set[int]
+
+    # (layer_name, block_id) -> (location, block_idx)
+    # the block in the CPU, the block_idx is the index in the CPU block
+    # and also is the block_id
+    layer_block_mapping: dict[tuple[str, int], tuple[str, int]]
+    # (gpu_block_idx) -> (layer_name, block_id)
+    gpu_block_mapping: dict[int, tuple[str, int]]
+    stats: dict[str, int]
+
     def __init__(
         self,
+        # KV Cache shape
         cache_shape: torch.Size,
-        num_cpu_blocks: dict[str, int],
+        # the cpu block for each layer like the a form
+        # of {layer_name: num_blocks}
+        layer_names: list[str],
+        num_cpu_blocks: int,
         num_gpu_blocks: int,
         num_streams: int = 4,
+        kv_cache_dtype: torch.dtype = torch.float32,
     ):
         self.gpu_device = torch.device("cuda")
         self.cache_shape = cache_shape
@@ -21,22 +55,24 @@ class UnifiedMemoryCache:
         self.current_stream = 0
 
         # Initialize CPU blocks with pinned memory for each layer
-        self.cpu_blocks = {}
-        self.cpu_block_usage = {}
-        self.cpu_lru = {}
-        for layer_name, num_blocks in num_cpu_blocks.items():
+        self.cpu_blocks = dict()
+        self.cpu_block_usage = dict()
+
+        for layer_name in layer_names:
             self.cpu_blocks[layer_name] = torch.zeros(
-                (num_blocks, *cache_shape),
-                dtype=torch.float32,
-                pin_memory=True,  # Use pinned memory for faster transfers
+                (num_cpu_blocks, *cache_shape),
+                dtype=kv_cache_dtype,
+                # Use pinned memory for faster transfers
+                pin_memory=True,
             )
-            self.cpu_block_usage[layer_name] = torch.zeros(num_blocks, dtype=torch.bool)
-            self.cpu_lru[layer_name] = []
+            self.cpu_block_usage[layer_name] = torch.zeros(
+                num_cpu_blocks, dtype=torch.bool
+            )
 
         # Initialize GPU blocks
         self.gpu_blocks = torch.zeros(
             (num_gpu_blocks, *cache_shape),
-            dtype=torch.float32,
+            dtype=kv_cache_dtype,
             device=self.gpu_device,
         )
 
@@ -44,10 +80,12 @@ class UnifiedMemoryCache:
         self.gpu_block_usage = torch.zeros(
             num_gpu_blocks, dtype=torch.bool, device=self.gpu_device
         )
-        self.block_mapping = {}  # (block_id) -> (location, layer_name, block_idx)
+
+        # (block_id) -> (location, layer_name, block_idx)
+        self.layer_block_mapping = dict()
 
         # LRU tracking
-        self.gpu_lru = []
+        self.gpu_lru = list()
 
         # Pinned blocks tracking
         self.pinned_blocks = set()
@@ -67,69 +105,69 @@ class UnifiedMemoryCache:
         stream = self.streams[self.current_stream]
         self.current_stream = (self.current_stream + 1) % self.num_streams
         return stream
-    
-    def get_cpu_blocks(self, layer_name: str) -> torch.Tensor:
+
+    def get_layer_cpu_blocks(self, layer_name: str) -> torch.Tensor:
         return self.cpu_blocks[layer_name]
 
-    def get(self, block_id: int, target: str = "gpu", layer_name: str = None) -> int:
+    def get_gpu_blocks(self) -> torch.Tensor:
+        """
+        get all gpu blocks, for flash_attention only
+        """
+        return self.gpu_blocks
+
+    def get(self, layer_name: str, block_id: int, target: str = "gpu") -> int:
         """
         Get a block from cache. If target is 'gpu' and block is in CPU,
         it will be moved to GPU. Returns the block index in target location,
         or None if block not found.
         """
-        if block_id not in self.block_mapping:
-            self.stats["misses"] += 1
-            return None
+        if (layer_name, block_id) not in self.layer_block_mapping:
+            raise RuntimeError("Block not found in cache")
 
-        location, block_layer, block_idx = self.block_mapping[block_id]
+        location, block_idx = self.layer_block_mapping[(layer_name, block_id)]
 
         # If target is GPU but block is in CPU, move it to GPU
         if target == "gpu" and location == "cpu":
             self.stats["cpu_to_gpu_fetches"] += 1
-            success = self.move_to_gpu(block_id)
+            success = self._move_to_gpu(layer_name, block_id)
             if not success:
-                # If move failed, just return CPU block index
-                if block_id not in self.pinned_blocks:
-                    self.cpu_lru[block_layer].remove(block_id)
-                    self.cpu_lru[block_layer].append(block_id)
-                self.stats["cpu_hits"] += 1
-                return None
+                raise RuntimeError(
+                    "The gpu memory usage is full, please add more memory"
+                )
             # Get updated location after move
-            location, block_layer, block_idx = self.block_mapping[block_id]
-
-        # Update LRU and return block index
-        if location == "cpu":
-            if block_id not in self.pinned_blocks:
-                self.cpu_lru[block_layer].remove(block_id)
-                self.cpu_lru[block_layer].append(block_id)
-            self.stats["cpu_hits"] += 1
-            return None if target == "gpu" else block_idx
-        else:  # gpu
-            if block_id not in self.pinned_blocks:
-                self.gpu_lru.remove(block_id)
-                self.gpu_lru.append(block_id)
+            location, block_idx = self.layer_block_mapping[
+                (layer_name, block_id)
+            ]
+        elif location == "gpu":
             self.stats["gpu_hits"] += 1
-            return block_idx
+
+        if block_idx not in self.pinned_blocks:
+            self.gpu_lru.remove(block_idx)
+            self.gpu_lru.append(block_idx)
+
+        return block_idx
 
     def put(
-        self, block_id: int, block: torch.Tensor, target: str = "gpu", layer_name: str = None
-    ) -> bool:
-        """Put a block into cache. Returns True if successful."""
+        self,
+        layer_name: str,
+        block_id: int,
+        block: torch.Tensor,
+        target: str = "gpu",
+    ) -> None:
+        """Put a block into cache. This function will be success or die."""
         if target not in ["cpu", "gpu"]:
             raise ValueError("Target must be either 'cpu' or 'gpu'")
-        
+
         if target == "cpu":
-            if layer_name is None:
-                raise ValueError("layer_name must be specified for CPU target")
             if layer_name not in self.cpu_blocks:
                 raise ValueError(f"Invalid layer_name: {layer_name}")
-            blocks = self.cpu_blocks[layer_name]
-            usage = self.cpu_block_usage[layer_name]
-            lru = self.cpu_lru[layer_name]
+            # for cpu, just copy it to the block
+            self.cpu_blocks[layer_name][block_id].copy_(block)
+            self.layer_block_mapping[(layer_name, block_id)] = ("cpu", block_id)
+            return True
         else:
             blocks = self.gpu_blocks
             usage = self.gpu_block_usage
-            lru = self.gpu_lru
 
         # Find free block or evict LRU
         free_idx = torch.where(~usage)[0]
@@ -137,158 +175,126 @@ class UnifiedMemoryCache:
             idx = free_idx[0].item()
         else:
             # If target is GPU and no free blocks, try to evict to CPU first
-            if target == "gpu":
-                evicted = self._evict_gpu_to_cpu()
-                if evicted:
-                    # Try again to find a free block
-                    free_idx = torch.where(~usage)[0]
-                    if len(free_idx) > 0:
-                        idx = free_idx[0].item()
-                    else:
-                        # Still no space, evict LRU
-                        idx = self._evict_lru(lru, target, layer_name)
-                        if idx is None:
-                            return False
-                else:
-                    # Couldn't evict to CPU, evict LRU
-                    idx = self._evict_lru(lru, target, layer_name)
-                    if idx is None:
-                        return False
+            evicted = self._evict_gpu_to_cpu()
+            if evicted is not None:
+                # Try again to find a free block
+                idx = evicted
             else:
-                # For CPU target, just evict LRU
-                idx = self._evict_lru(lru, target, layer_name)
-                if idx is None:
-                    return False
+                raise RuntimeError(
+                    "The gpu memory usage is full, please add more memory"
+                )
 
         # Store block using copy_() for pinned memory efficiency
-        if target == "gpu":
-            if block.device != self.gpu_device:
-                # Use stream for async copy
-                stream = self._get_next_stream()
-                with torch.cuda.stream(stream):
-                    blocks[idx].copy_(block, non_blocking=True)
-                # Synchronize to ensure copy is complete
-                stream.synchronize()
-            else:
-                blocks[idx].copy_(block)
-        else:  # cpu
-            if block.device != torch.device("cpu"):
-                blocks[idx].copy_(block.cpu())
-            else:
-                blocks[idx].copy_(block)
+        blocks[idx].copy_(block)
 
-        usage[idx] = True
+        self.gpu_block_usage[idx] = True
 
         # Update mapping and LRU
-        if block_id in self.block_mapping:
+        if (layer_name, block_id) in self.layer_block_mapping:
             # If block already exists somewhere, remove it
-            old_location, old_layer, old_idx = self.block_mapping[block_id]
+            old_location, old_idx = self.layer_block_mapping[
+                (layer_name, block_id)
+            ]
             if old_location == "cpu":
-                self.cpu_block_usage[old_layer][old_idx] = False
-                if block_id in self.cpu_lru[old_layer]:
-                    self.cpu_lru[old_layer].remove(block_id)
+                self.cpu_block_usage[layer_name][old_idx] = False
             else:
                 self.gpu_block_usage[old_idx] = False
                 if block_id in self.gpu_lru:
                     self.gpu_lru.remove(block_id)
 
-        self.block_mapping[block_id] = (target, layer_name if target == "cpu" else None, idx)
-        if block_id not in self.pinned_blocks:
-            lru.append(block_id)
+        self.layer_block_mapping[layer_name][block_id] = (
+            target,
+            idx,
+        )
+        self.gpu_lru.append(block_id)
         return True
 
-    def _evict_lru(self, lru, target: str, layer_name: str = None):
-        """
-        Helper to evict LRU block. 
-        Returns index of evicted block or None if no block can be evicted.
-        """
-        for lru_block_id in lru:
-            if lru_block_id not in self.pinned_blocks:
-                location, block_layer, idx = self.block_mapping[lru_block_id]
-                del self.block_mapping[lru_block_id]
-                lru.remove(lru_block_id)
-                return idx
+    # Try to evict a GPU block to CPU
+    def _evict_gpu_to_cpu(self) -> Optional[int]:
+        """Try to evict a GPU block to CPU. Returns block if successful."""
+        # Try to find a non-pinned block to evict
+        for block_idx in self.gpu_lru:
+            if block_idx not in self.pinned_blocks:
+                # Get block info
+                layer_name, block_id = self.gpu_block_mapping[block_idx]
+                block = self.gpu_blocks[block_idx]
+
+                self.put(block_id, layer_name, block, target="cpu")
+
+                self.gpu_block_usage[block_idx] = False
+                self.gpu_lru.remove(block_idx)
+                return block_idx
+        # if no non-pinned block found, return None
         return None
 
-    def _evict_gpu_to_cpu(self):
-        """Try to evict a GPU block to CPU. Returns True if successful."""
-        # Try to find a non-pinned block to evict
-        for block_id in self.gpu_lru:
-            if block_id not in self.pinned_blocks:
-                # Get block info
-                _, _, gpu_idx = self.block_mapping[block_id]
-                block = self.gpu_blocks[gpu_idx]
-
-                # Try to put in each CPU layer until success
-                for layer_name in self.cpu_blocks.keys():
-                    if self.put(block_id, block, target="cpu", layer_name=layer_name):
-                        self.stats["gpu_evictions"] += 1
-                        return True
-                
-                # If we couldn't put it in any CPU layer, continue to next block
-                continue
-
-        return False
-
-    def pin_block(self, block_id: int):
+    def pin_block(self, layer_name: str, block_id: int):
         """Pin a block to prevent it from being evicted."""
-        if block_id in self.block_mapping:
-            self.pinned_blocks.add(block_id)
+        if (layer_name, block_id) in self.layer_block_mapping:
+            location, idx = self.layer_block_mapping[(layer_name, block_id)]
+            if location != "gpu":
+                raise RuntimeError("Only GPU blocks can be pinned")
+            self.pinned_blocks.add(idx)
+        else:
+            raise RuntimeError("Block not found in cache")
 
     def unpin_block(self, block_id: int):
         """Unpin a block, allowing it to be evicted."""
         self.pinned_blocks.discard(block_id)
 
-    def multi_transfer(self, block_ids: list[int], target: str = "gpu", layer_name: str = None):
+    def batch_get(self, layer_name: str, block_ids: list[int]) -> list[int]:
         """
         Transfer multiple blocks to target location in parallel.
         For CPU target, layer_name must be specified.
         """
-        if target == "cpu" and layer_name is None:
-            raise ValueError("layer_name must be specified for CPU target")
-
-        self.stats["multi_transfers"] += 1
-        success = True
-
         # Group blocks by current location for efficient transfer
         cpu_blocks = []
-        gpu_blocks = []
         for block_id in block_ids:
-            if block_id in self.block_mapping:
-                location, _, _ = self.block_mapping[block_id]
-                if location == "cpu":
-                    cpu_blocks.append(block_id)
-                else:
-                    gpu_blocks.append(block_id)
+            location, idx = self.layer_block_mapping[(layer_name, block_id)]
+            if location == "cpu":
+                cpu_blocks.append(idx)
 
         # Handle transfers based on target
-        if target == "gpu":
-            # Move CPU blocks to GPU in parallel
-            for block_id in cpu_blocks:
-                if not self.move_to_gpu(block_id):
-                    success = False
-        else:  # target == "cpu"
-            # Move GPU blocks to CPU in parallel
-            for block_id in gpu_blocks:
-                location, _, gpu_idx = self.block_mapping[block_id]
-                block = self.gpu_blocks[gpu_idx]
-                if not self.put(block_id, block, target="cpu", layer_name=layer_name):
-                    success = False
+        free_idx = torch.where(~self.gpu_block_usage)[0].tolist()
+        if len(free_idx) < len(cpu_blocks):
+            # should evict from GPU
+            needed_blocks = len(cpu_blocks) - len(free_idx)
+            for _ in range(needed_blocks):
+                free_idx.append(self._evict_gpu_to_cpu())
 
-        return success
+        for cpu_block in cpu_blocks:
+            streams = [self._get_next_stream() for _ in range(len(cpu_blocks))]
+            for cpu_block, gpu_free_idx, stream in zip(
+                cpu_blocks, free_idx, streams
+            ):
+                with torch.cuda.stream(stream):
+                    self.gpu_blocks[free_idx].copy_(
+                        self.cpu_blocks[layer_name][cpu_block],
+                        non_blocking=True,
+                    )
+                    self.layer_block_mapping[(layer_name, cpu_block)] = (
+                        "gpu",
+                        free_idx,
+                    )
+                # do lru
+                self.gpu_lru.remove(free_idx)
+                self.gpu_lru.append(free_idx)
 
-    def move_to_gpu(self, block_id: int) -> bool:
+        for stream in self.streams:
+            stream.synchronize()
+        return free_idx
+
+    def _move_to_gpu(self, layer_name: str, block_id: int) -> bool:
         """Helper to move a CPU block to GPU. Returns True if successful."""
-        if block_id not in self.block_mapping:
-            return False
+        if (layer_name, block_id) not in self.layer_block_mapping:
+            raise RuntimeError("Block not found in cache")
 
-        location, layer_name, cpu_idx = self.block_mapping[block_id]
+        location, cpu_idx = self.layer_block_mapping[(layer_name, block_id)]
         if location != "cpu":
             return True  # Already in GPU
 
         # Try to put block in GPU
         block = self.cpu_blocks[layer_name][cpu_idx]
-        return self.put(block_id, block, target="gpu")
+        return self.put(block_id, block, target="gpu", layer_name=layer_name)
 
     def get_stats(self):
         """Get cache statistics."""
