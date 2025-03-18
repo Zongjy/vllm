@@ -14,6 +14,14 @@ from typing import Optional, Tuple
 class KVCacheContextManager:
     def __init__(self, vllm_config: VllmConfig, device: torch.device="cuda"):
         self.vllm_config = vllm_config
+        self.cache_config = vllm_config.kv_cache_config
+        self.model_config = vllm_config.model_config
+        self.block_size = self.cache_config.block_size
+        self.max_model_len = self.model_config.max_model_len
+        self.max_num_blocks_per_req = cdiv(
+            self.max_model_len, self.block_size
+        )
+
         self.device = device
         # NOTE(liyi): Lazy initialization after model_runner loads the model
         self.kv_cache = None
@@ -21,7 +29,6 @@ class KVCacheContextManager:
         self.topk = 4
 
     def _initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
-        self.layer2index = {}
         if len(kv_cache_config.groups) > 1:
             raise NotImplementedError(
                 "Hybrid models with more than one KV cache type are not "
@@ -81,20 +88,18 @@ class KVCacheContextManager:
             and block size is 2.
         """
         # Get block size from cache shape
-        num_seqs = seqlens_k.numel()
-        block_size = self.kv_cache.get_cache_shape()[0]
-        cu_seqlens_k = torch.cumsum(seqlens_k, 0)
-        for seq_idx in range(num_seqs):
-            # Get the block_id for this token
-            last_block_id = slot_mapping[cu_seqlens_k[seq_idx] + 1].item()
-            tensor_id = seqlens_k[seq_idx].item() % block_size
-            if tensor_id == 0:
-                raise NotImplementedError("to be done")
-            # write to the block
-            self.kv_cache.gpu_blocks[
-                last_block_id, tensor_id, :, :, 0].copy_(key[seq_idx])
-            self.kv_cache.gpu_blocks[
-                last_block_id, tensor_id, :, :, 1].copy_(value[seq_idx])
+
+        num_tokens = key.shape[0]
+        for token_idx in range(num_tokens):
+            slot_idx = slot_mapping[token_idx]
+            block_idx = slot_idx // self.block_size
+            block_offset = slot_idx % self.block_size
+            self.kv_cache.gpu_blocks[block_idx, block_offset, :, :, 0].copy_(
+                key[token_idx]
+            )
+            self.kv_cache.gpu_blocks[block_idx, block_offset, :, :, 1].copy_(
+                value[token_idx]
+            )
 
 
     def load_kvcache(
