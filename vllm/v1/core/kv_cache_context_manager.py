@@ -6,11 +6,9 @@ from vllm.v1.kv_cache_interface import (
     KVCacheConfig,
 )
 from vllm.v1.attention.backends.sparse_offload_attn import SparseOffloadAttentionBackend
-from vllm.model_executor.models.utils import extract_layer_index
-from collections import defaultdict
 from vllm.utils import cdiv
 from vllm.v1.core.memory_pool import UnifiedMemoryCache
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Tuple
 
 
 class KVCacheContextManager:
@@ -21,8 +19,6 @@ class KVCacheContextManager:
         self.kv_cache = None
         # TODO: the underlying are sparse attention parameters, we fix it now
         self.topk = 4
-        # Track current positions in blocks
-        self.block_positions = defaultdict(dict)  # layer_name -> block_id -> current_pos
 
     def _initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.layer2index = {}
@@ -38,6 +34,7 @@ class KVCacheContextManager:
             first_layer_spec.block_size,
             first_layer_spec.num_kv_heads,
             first_layer_spec.head_size,
+            2, # Key and value
         )
         dtype = first_layer_spec.dtype
 
@@ -64,6 +61,7 @@ class KVCacheContextManager:
             num_cpu_blocks=num_cpu_blocks,
             num_gpu_blocks=total_blocks // 2,
             num_streams=4,
+            dtype=dtype,
         )
 
     def update_kvcache(
@@ -71,7 +69,7 @@ class KVCacheContextManager:
         layer_name: str,
         key: torch.Tensor,
         value: torch.Tensor,
-        block_table: torch.Tensor,
+        seqlens_k: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
         """
@@ -82,39 +80,22 @@ class KVCacheContextManager:
             where K is max_num_blocks_per_req
             and block size is 2.
         """
-        if layer_name not in self.block_positions:
-            self.block_positions[layer_name] = defaultdict(int)
-        
         # Get block size from cache shape
-        block_size = self.kv_cache.cache_shape[0]
-        
-        # For each token, store its key/value in the corresponding block
-        for token_idx, block_id in enumerate(slot_mapping):
-            block_id = block_id.item()
-            current_pos = self.block_positions[layer_name][block_id]
-            
-            # Create a new block on GPU if needed
-            gpu_idx = self.kv_cache.get(block_id, target="gpu")
-            if gpu_idx is None:
-                # Initialize a new block
-                new_block = torch.zeros(
-                    self.kv_cache.cache_shape,
-                    dtype=key.dtype,
-                    device=self.device
-                )
-                # Put the new block in GPU cache
-                self.kv_cache.put(block_id, new_block, target="gpu")
-                gpu_idx = self.kv_cache.get(block_id, target="gpu")
-                if gpu_idx is None:
-                    raise RuntimeError(f"Failed to allocate GPU block for block_id {block_id}")
-            
-            # Copy key/value to the block at current position
-            self.kv_cache.gpu_blocks[gpu_idx, current_pos].copy_(key[token_idx])
-            self.kv_cache.gpu_blocks[gpu_idx, current_pos].copy_(value[token_idx])
-            
-            # Update position, ensuring we don't exceed block size
-            current_pos = (current_pos + 1) % block_size
-            self.block_positions[layer_name][block_id] = current_pos
+        num_seqs = seqlens_k.numel()
+        block_size = self.kv_cache.get_cache_shape()[0]
+        cu_seqlens_k = torch.cumsum(seqlens_k, 0)
+        for seq_idx in range(num_seqs):
+            # Get the block_id for this token
+            last_block_id = slot_mapping[cu_seqlens_k[seq_idx] + 1].item()
+            tensor_id = seqlens_k[seq_idx].item() % block_size
+            if tensor_id == 0:
+                raise NotImplementedError("to be done")
+            # write to the block
+            self.kv_cache.gpu_blocks[
+                last_block_id, tensor_id, :, :, 0].copy_(key[seq_idx])
+            self.kv_cache.gpu_blocks[
+                last_block_id, tensor_id, :, :, 1].copy_(value[seq_idx])
+
 
     def load_kvcache(
         self,
@@ -131,7 +112,7 @@ class KVCacheContextManager:
         Returns: (gpu_block_table, gpu_key_cache, gpu_value_cache, sparse_seqlens_k)
         """
         # Get all CPU blocks for this layer
-        cpu_blocks = self.kv_cache.get_cpu_blocks(layer_name)
+        cpu_blocks = self.kv_cache.get_layer_cpu_blocks(layer_name)
 
         # Perform sparse selection on CPU
         sparse_block_table, sparse_seqlens_k = varlen_sparse_kv_selection(
@@ -145,22 +126,20 @@ class KVCacheContextManager:
         )
 
         # Move selected blocks to GPU and build GPU block table
-        gpu_block_mapping = {}  # original_block_id -> gpu_block_id
-        for block_id in sparse_block_table.unique():
-            gpu_idx = self.kv_cache.get(block_id.item(), target="gpu")
-            if gpu_idx is None:
-                raise ValueError(f"Failed to move block {block_id} to GPU")
-            gpu_block_mapping[block_id.item()] = gpu_idx
-
-        # Create GPU block table using the mapping
-        gpu_block_table = torch.tensor(
-            [gpu_block_mapping[bid.item()] for bid in sparse_block_table.flatten()],
-            device=gpu_device
-        ).view_as(sparse_block_table)
-
+        num_seqs = cu_seqlens_q.numel() - 1
+        for seq_idx in range(num_seqs):
+            k_len = sparse_seqlens_k[seq_idx].item()
+            for blk_idx in range(k_len):
+                cpu_idx = sparse_block_table[seq_idx, blk_idx].item()
+                gpu_idx = self.kv_cache.get(cpu_idx, target="gpu")
+                if gpu_idx is None:
+                    raise ValueError(f"Failed to move block {cpu_idx} to GPU")
+                sparse_block_table[seq_idx, blk_idx] = gpu_idx 
+        
+        gpu_block_table = sparse_block_table.to(gpu_device)
         # Split GPU blocks into separate key and value caches
-        gpu_blocks = self.kv_cache.gpu_blocks
-        gpu_key_cache, gpu_value_cache = gpu_blocks.unbind(0)
+        gpu_blocks = self.kv_cache.get_gpu_blocks()
+        gpu_key_cache, gpu_value_cache = gpu_blocks.unbind(dim=-1)
 
         return gpu_block_table, gpu_key_cache, gpu_value_cache, sparse_seqlens_k
 

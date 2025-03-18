@@ -70,6 +70,7 @@ class UnifiedMemoryCache:
             )
 
         # Initialize GPU blocks
+        # [num_blocks, block_size, num_heads, head_size, 2]
         self.gpu_blocks = torch.zeros(
             (num_gpu_blocks, *cache_shape),
             dtype=kv_cache_dtype,
@@ -99,6 +100,10 @@ class UnifiedMemoryCache:
             "misses": 0,
             "multi_transfers": 0,
         }
+        self.cache_shape = cache_shape
+    
+    def get_cache_shape(self):
+        return self.cache_shape
 
     def _get_next_stream(self):
         """Get the next available CUDA stream in a round-robin fashion."""
