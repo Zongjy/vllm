@@ -14,9 +14,6 @@ from typing import Optional, Dict, List, Tuple
 
 
 class KVCacheContextManager:
-    # TODO(liyi): Unified with KVCacheManager for:
-    # 1. token_budget calculation
-    # 2. LRU policy for swapping kvcache blocks
     def __init__(self, vllm_config: VllmConfig, device: torch.device="cuda"):
         self.vllm_config = vllm_config
         self.device = device
@@ -24,7 +21,8 @@ class KVCacheContextManager:
         self.kv_cache = None
         # TODO: the underlying are sparse attention parameters, we fix it now
         self.topk = 4
-        # Track the current block and position for each layer
+        # Track current positions in blocks
+        self.block_positions = defaultdict(dict)  # layer_name -> block_id -> current_pos
 
     def _initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         self.layer2index = {}
@@ -58,7 +56,6 @@ class KVCacheContextManager:
             assert layer_spec.head_size == first_layer_spec.head_size
             
             num_cpu_blocks[layer_name] = num_blocks
-            self.current_block_info[layer_name] = (0, 0)  # (block_id, position)
 
         # Initialize UnifiedMemoryCache with layer-specific CPU blocks
         total_blocks = sum(num_cpu_blocks.values())
@@ -78,13 +75,46 @@ class KVCacheContextManager:
         slot_mapping: torch.Tensor,
     ) -> None:
         """
-        Update the kv cache with the given slot mapping & block_table.
-        The key and value are for a single token, and need to be stored in the current block.
+            Update the kv cache with the given slot mapping.
+            slot_mapping maps token_id to block_id, 
+            e.g.:
+                [0, 0, K, K, K+1, K+1, K+2, 2K, 2K, 2K+1] 
+            where K is max_num_blocks_per_req
+            and block size is 2.
         """
-        if layer_name not in self.current_block_info:
-            raise ValueError(f"Layer {layer_name} not initialized")
-
-        raise NotImplementedError
+        if layer_name not in self.block_positions:
+            self.block_positions[layer_name] = defaultdict(int)
+        
+        # Get block size from cache shape
+        block_size = self.kv_cache.cache_shape[0]
+        
+        # For each token, store its key/value in the corresponding block
+        for token_idx, block_id in enumerate(slot_mapping):
+            block_id = block_id.item()
+            current_pos = self.block_positions[layer_name][block_id]
+            
+            # Create a new block on GPU if needed
+            gpu_idx = self.kv_cache.get(block_id, target="gpu")
+            if gpu_idx is None:
+                # Initialize a new block
+                new_block = torch.zeros(
+                    self.kv_cache.cache_shape,
+                    dtype=key.dtype,
+                    device=self.device
+                )
+                # Put the new block in GPU cache
+                self.kv_cache.put(block_id, new_block, target="gpu")
+                gpu_idx = self.kv_cache.get(block_id, target="gpu")
+                if gpu_idx is None:
+                    raise RuntimeError(f"Failed to allocate GPU block for block_id {block_id}")
+            
+            # Copy key/value to the block at current position
+            self.kv_cache.gpu_blocks[gpu_idx, current_pos].copy_(key[token_idx])
+            self.kv_cache.gpu_blocks[gpu_idx, current_pos].copy_(value[token_idx])
+            
+            # Update position, ensuring we don't exceed block size
+            current_pos = (current_pos + 1) % block_size
+            self.block_positions[layer_name][block_id] = current_pos
 
     def load_kvcache(
         self,
@@ -98,57 +128,41 @@ class KVCacheContextManager:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Load kv cache for the given layer with sparse selection.
-        Returns: (gpu_block_table, kvcache_k, kvcache_v, sparse_seqlens_k)
+        Returns: (gpu_block_table, gpu_key_cache, gpu_value_cache, sparse_seqlens_k)
         """
-        # NOTE(liyi): need fix
-        # First get the blocks from CPU
-        cpu_blocks = []
-        for block_id in block_table.unique():
-            block = self.kv_cache.get(block_id, target="cpu", layer_name=layer_name)
-            if block is not None:
-                cpu_blocks.append(block)
+        # Get all CPU blocks for this layer
+        cpu_blocks = self.kv_cache.get_cpu_blocks(layer_name)
 
-        if not cpu_blocks:
-            raise ValueError(f"No blocks found for layer {layer_name}")
-
-        # Stack blocks into a single tensor for sparse selection
-        key_cache = torch.stack(cpu_blocks, dim=0)
-
-        # Perform sparse selection
+        # Perform sparse selection on CPU
         sparse_block_table, sparse_seqlens_k = varlen_sparse_kv_selection(
-            query.to(self.device),
-            key_cache,
-            cu_seqlens_q=cu_seqlens_q.to(self.device),
-            seqlens_k=seqlens_k.to(self.device),
-            block_table=block_table.to(self.device),
+            query.to("cpu"),
+            cpu_blocks.unbind(0),
+            cu_seqlens_q=cu_seqlens_q.to("cpu"),
+            seqlens_k=seqlens_k.to("cpu"),
+            block_table=block_table.to("cpu"),
             topk=self.topk,
             sliding_window=sliding_window,
         )
 
-        # Transfer selected blocks to GPU
-        gpu_blocks = []
-        gpu_block_mapping = {}  # old_block_id -> new_gpu_block_id
-        for i, block_id in enumerate(sparse_block_table.unique()):
-            block = self.kv_cache.get(block_id, target="cpu", layer_name=layer_name)
-            if block is None:
-                raise ValueError(f"Block {block_id} not found in layer {layer_name}")
-            
-            # Move block to GPU
-            gpu_block = block.to(gpu_device)
-            self.kv_cache.put(i, gpu_block, target="gpu")
-            gpu_blocks.append(gpu_block)
-            gpu_block_mapping[block_id.item()] = i
+        # Move selected blocks to GPU and build GPU block table
+        gpu_block_mapping = {}  # original_block_id -> gpu_block_id
+        for block_id in sparse_block_table.unique():
+            gpu_idx = self.kv_cache.get(block_id.item(), target="gpu")
+            if gpu_idx is None:
+                raise ValueError(f"Failed to move block {block_id} to GPU")
+            gpu_block_mapping[block_id.item()] = gpu_idx
 
-        # Create new GPU block table
-        gpu_block_table = torch.tensor([gpu_block_mapping[bid.item()] 
-                                      for bid in sparse_block_table.flatten()],
-                                     device=gpu_device).view_as(sparse_block_table)
+        # Create GPU block table using the mapping
+        gpu_block_table = torch.tensor(
+            [gpu_block_mapping[bid.item()] for bid in sparse_block_table.flatten()],
+            device=gpu_device
+        ).view_as(sparse_block_table)
 
-        # Stack GPU blocks into key and value caches
-        kvcache = torch.stack(gpu_blocks, dim=0)  # [num_blocks, block_size, num_heads, head_size]
-        kvcache_k, kvcache_v = kvcache.unbind(0)  # Split into key and value caches
+        # Split GPU blocks into separate key and value caches
+        gpu_blocks = self.kv_cache.gpu_blocks
+        gpu_key_cache, gpu_value_cache = gpu_blocks.unbind(0)
 
-        return gpu_block_table, kvcache_k, kvcache_v, sparse_seqlens_k
+        return gpu_block_table, gpu_key_cache, gpu_value_cache, sparse_seqlens_k
 
 
 def varlen_sparse_kv_selection(

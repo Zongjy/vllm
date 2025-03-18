@@ -67,11 +67,15 @@ class UnifiedMemoryCache:
         stream = self.streams[self.current_stream]
         self.current_stream = (self.current_stream + 1) % self.num_streams
         return stream
+    
+    def get_cpu_blocks(self, layer_name: str) -> torch.Tensor:
+        return self.cpu_blocks[layer_name]
 
-    def get(self, block_id: int, target: str = "gpu", layer_name: str = None) -> torch.Tensor:
+    def get(self, block_id: int, target: str = "gpu", layer_name: str = None) -> int:
         """
         Get a block from cache. If target is 'gpu' and block is in CPU,
-        it will be moved to GPU. Returns None if block not found.
+        it will be moved to GPU. Returns the block index in target location,
+        or None if block not found.
         """
         if block_id not in self.block_mapping:
             self.stats["misses"] += 1
@@ -84,28 +88,28 @@ class UnifiedMemoryCache:
             self.stats["cpu_to_gpu_fetches"] += 1
             success = self.move_to_gpu(block_id)
             if not success:
-                # If move failed, just return CPU block
+                # If move failed, just return CPU block index
                 if block_id not in self.pinned_blocks:
                     self.cpu_lru[block_layer].remove(block_id)
                     self.cpu_lru[block_layer].append(block_id)
                 self.stats["cpu_hits"] += 1
-                return self.cpu_blocks[block_layer][block_idx]
+                return None
             # Get updated location after move
             location, block_layer, block_idx = self.block_mapping[block_id]
 
-        # Update LRU and return block
+        # Update LRU and return block index
         if location == "cpu":
             if block_id not in self.pinned_blocks:
                 self.cpu_lru[block_layer].remove(block_id)
                 self.cpu_lru[block_layer].append(block_id)
             self.stats["cpu_hits"] += 1
-            return self.cpu_blocks[block_layer][block_idx]
+            return None if target == "gpu" else block_idx
         else:  # gpu
             if block_id not in self.pinned_blocks:
                 self.gpu_lru.remove(block_id)
                 self.gpu_lru.append(block_id)
             self.stats["gpu_hits"] += 1
-            return self.gpu_blocks[block_idx]
+            return block_idx
 
     def put(
         self, block_id: int, block: torch.Tensor, target: str = "gpu", layer_name: str = None
