@@ -14,6 +14,8 @@ from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.utils import cdiv
 
+from vllm.v1.core.kv_cache_context_manager import varlen_sparse_kv_selection
+
 if TYPE_CHECKING:
     from vllm.v1.core.scheduler_output import SchedulerOutput
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -258,6 +260,15 @@ class FlashAttentionImpl(AttentionImpl):
         # Compute attention and update output up to `num_actual_tokens`.
         if not attn_metadata.use_cascade:
             # Regular attention (common case).
+            sparse_block_table, sparse_seqlens_k = varlen_sparse_kv_selection(
+                query,
+                key_cache,
+                cu_seqlens_q=attn_metadata.query_start_loc,
+                seqlens_k=attn_metadata.seq_lens,
+                block_table=attn_metadata.block_table,
+                ratio=0.6,
+                sliding_window=None,
+            )
             flash_attn_varlen_func(
                 q=query[:num_actual_tokens],
                 k=key_cache,
@@ -265,13 +276,15 @@ class FlashAttentionImpl(AttentionImpl):
                 out=output[:num_actual_tokens],
                 cu_seqlens_q=attn_metadata.query_start_loc,
                 max_seqlen_q=attn_metadata.max_query_len,
-                seqused_k=attn_metadata.seq_lens,
+                # seqused_k=attn_metadata.seq_lens,
+                seqused_k=sparse_seqlens_k,
                 max_seqlen_k=attn_metadata.max_seq_len,
                 softmax_scale=self.scale,
                 causal=True,
                 alibi_slopes=self.alibi_slopes,
                 window_size=self.sliding_window,
-                block_table=attn_metadata.block_table,
+                # block_table=attn_metadata.block_table,
+                block_table=sparse_block_table,
                 softcap=self.logits_soft_cap,
                 fa_version=self.vllm_flash_attn_version,
             )

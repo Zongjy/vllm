@@ -73,10 +73,8 @@ class KVCacheContextManager:
 
     def update_kvcache(
         self,
-        layer_name: str,
         key: torch.Tensor,
         value: torch.Tensor,
-        seqlens_k: torch.Tensor,
         slot_mapping: torch.Tensor,
     ) -> None:
         """
@@ -122,7 +120,7 @@ class KVCacheContextManager:
         # Perform sparse selection on CPU
         sparse_block_table, sparse_seqlens_k = varlen_sparse_kv_selection(
             query.to("cpu"),
-            cpu_blocks.unbind(0),
+            cpu_blocks.unbind(dim=-1),
             cu_seqlens_q=cu_seqlens_q.to("cpu"),
             seqlens_k=seqlens_k.to("cpu"),
             block_table=block_table.to("cpu"),
@@ -157,7 +155,7 @@ def varlen_sparse_kv_selection(
     # seq_lens, used to index kv cache, listed, k means key
     seqlens_k: torch.Tensor,
     block_table: torch.Tensor,
-    topk: int,
+    ratio: float,
     sliding_window: Optional[int],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
@@ -207,7 +205,9 @@ def varlen_sparse_kv_selection(
         num_sparse_blks = (
             num_seq_blks - num_sink_blks - num_local_blks
         )  # blocks for sparse attention
-        if num_sparse_blks == 0 or num_sparse_blks <= topk:
+        # if num_sparse_blks == 0 or num_sparse_blks <= topk:
+        topk = max(1, min(num_sparse_blks, int(num_sparse_blks * ratio)))
+        if num_sparse_blks <= topk:
             continue
 
         # select the blocks
@@ -233,7 +233,6 @@ def varlen_sparse_kv_selection(
             "qhd,khd->qhk", q, k_blks_pooled
         ).float()  # [q_len, num_heads, num_sparse_blocks]
         gate_pooled = gate.mean(dim=0).mean(dim=0)  # [num_sparse_blocks]
-
         _, sel_blks_idx = torch.topk(
             gate_pooled, k=topk, largest=True, sorted=False
         )  # idx in block_table

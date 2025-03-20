@@ -5,7 +5,7 @@ import vllm.logger
 import os
 
 os.environ["VLLM_USE_V1"] = "1"
-os.environ["VLLM_USE_SPARSE_OFFLOAD"] = "1"
+# os.environ["VLLM_USE_SPARSE_OFFLOAD"] = "1"
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 os.makedirs("logs", exist_ok=True)
 
